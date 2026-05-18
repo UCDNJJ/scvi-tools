@@ -64,6 +64,12 @@ class MULTIVI(
     ----------
     adata
         MuData object that has been registered via :meth:`~scvi.model.MULTIVI.setup_mudata`.
+        Can be ``None`` when initializing from a precomputed ``registry`` and training with
+        ``train(datamodule=...)``.
+    registry
+        Registry dictionary produced by a compatible datamodule (for example,
+        :class:`~scvi.dataloaders.MultiVIMappedCollectionDataModule`). Use this when
+        ``adata`` is ``None``.
     n_genes
         The number of gene expression features (genes).
     n_regions
@@ -127,6 +133,13 @@ class MULTIVI(
     >>>             "atac_layer": "atac"})
     >>> vae = scvi.model.MULTIVI(mdata)
     >>> vae.train()
+    >>> datamodule = scvi.dataloaders.MultiVIMappedCollectionDataModule(
+    ...     rna_collection=None,
+    ...     atac_collection=atac_collection,
+    ...     batch_key="batch",
+    ... )
+    >>> vae = scvi.model.MULTIVI(adata=None, registry=datamodule.registry)
+    >>> vae.train(datamodule=datamodule)
 
     Notes (for using setup_anndata)
     ---------------------------------
@@ -340,6 +353,13 @@ class MULTIVI(
         plan_kwargs
             Keyword args for :class:`~scvi.train.TrainingPlan`. Keyword arguments passed to
             `train()` will overwrite values present in `plan_kwargs`, when appropriate.
+        datamodule
+            Optional datamodule that provides ``train_dataloader``, ``val_dataloader``,
+            and ``registry`` metadata for model initialization. This is required when
+            :class:`~scvi.model.MULTIVI` is initialized with ``adata=None`` and ``registry``.
+            For example, this enables ATAC-only training with
+            :class:`~scvi.dataloaders.MultiVIMappedCollectionDataModule` by passing
+            ``rna_collection=None`` and an ``atac_collection``.
         **kwargs
             Other keyword args for :class:`~scvi.train.Trainer`.
         """
