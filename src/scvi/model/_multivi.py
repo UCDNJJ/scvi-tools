@@ -231,7 +231,7 @@ class MULTIVI(
                 n_cats_per_cov = (
                     self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY).n_cats_per_key
                     if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry
-                    else None
+                    else []
                 )
                 use_size_factor_key = (
                     REGISTRY_KEYS.SIZE_FACTOR_KEY in self.adata_manager.data_registry
@@ -244,7 +244,7 @@ class MULTIVI(
                 n_cats_per_cov = (
                     tuple(cat_cov_state_registry["n_cats_per_key"])
                     if len(cat_cov_state_registry) > 0
-                    else None
+                    else ()
                 )
                 use_size_factor_key = bool(
                     self.registry["setup_args"].get(f"{REGISTRY_KEYS.SIZE_FACTOR_KEY}_key")
@@ -328,13 +328,16 @@ class MULTIVI(
             are split in the sequential order of the data according to `validation_size` and
             `train_size` percentages.
         batch_size
-            Minibatch size to use during training.
+            Minibatch size to use during training. Ignored when ``datamodule`` is provided,
+            because batching is controlled by the external datamodule.
         weight_decay
             weight decay regularization term for optimization
         eps
             Optimizer eps
         early_stopping
-            Whether to perform early stopping with respect to the validation set.
+            Whether to perform early stopping with respect to the validation set. If
+            ``datamodule`` is provided and its ``val_dataloader()`` returns ``None``,
+            early stopping is automatically disabled.
         check_val_every_n_epoch
             Check val every n train epochs. By default, val is not checked, unless `early_stopping`
             is `True`. If so, val is checked every epoch.
@@ -360,6 +363,8 @@ class MULTIVI(
             For example, this enables ATAC-only training with
             :class:`~scvi.dataloaders.MultiVIMappedCollectionDataModule` by passing
             ``rna_collection=None`` and an ``atac_collection``.
+            When provided, ``train_size``, ``validation_size``, ``shuffle_set_split``,
+            and ``batch_size`` are ignored.
         **kwargs
             Other keyword args for :class:`~scvi.train.Trainer`.
         """
@@ -409,6 +414,15 @@ class MULTIVI(
                 self.n_genes = datamodule.n_vars
                 self.n_regions = datamodule.n_regions
                 self.n_proteins = 0
+            val_dataloader = datamodule.val_dataloader()
+            if early_stopping and val_dataloader is None:
+                early_stopping = False
+                warnings.warn(
+                    "Disabled early stopping because the provided datamodule does not expose "
+                    "a validation dataloader.",
+                    UserWarning,
+                    stacklevel=settings.warnings_stacklevel,
+                )
             data_splitter = datamodule
         training_plan = self._training_plan_cls(self.module, **plan_kwargs)
         runner = self._train_runner_cls(

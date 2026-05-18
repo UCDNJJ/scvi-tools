@@ -498,11 +498,16 @@ class _CollectionBackedAnnData:
             row_indices[artifact_idx].append(row_idx)
 
         for artifact_idx, positions in row_positions.items():
-            matrix = self._adatas[artifact_idx][row_indices[artifact_idx]].X
+            artifact_row_indices = np.asarray(row_indices[artifact_idx], dtype=np.int64)
+            sort_order = np.argsort(artifact_row_indices)
+            sorted_row_indices = artifact_row_indices[sort_order]
+            matrix = self._adatas[artifact_idx][sorted_row_indices].X
             if issparse(matrix):
                 matrix = matrix.toarray()
             else:
                 matrix = np.asarray(matrix)
+            restore_order = np.argsort(sort_order)
+            matrix = matrix[restore_order]
             out[np.asarray(positions, dtype=np.int64)] = matrix.astype(np.float32, copy=False)
         return out
 
@@ -693,9 +698,9 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         return 1
 
     @property
-    def n_cats_per_cov(self) -> list[int] | None:
+    def n_cats_per_cov(self) -> list[int]:
         if self._categorical_covariate_keys is None:
-            return None
+            return []
         return [len(encoder.classes_) for encoder in self._categorical_covariate_encoders]
 
     @property

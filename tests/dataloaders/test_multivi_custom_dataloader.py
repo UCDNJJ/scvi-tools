@@ -101,7 +101,6 @@ def _create_and_train_multivi_model(datamodule, modality_weights: str = "equal")
         datamodule=datamodule,
         max_epochs=1,
         batch_size=4,
-        early_stopping=False,
         adversarial_mixing=True,
     )
     return model
@@ -258,3 +257,22 @@ def test_multivi_custom_dataloader_requires_collection():
             rna_collection=None,
             atac_collection=None,
         )
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_multivi_custom_dataloader_no_extra_cat_covs_uses_batch_and_trains(tmp_path):
+    rna_collection, atac_collection, _, _, _ = _make_multivi_collections(tmp_path, fully_paired=True)
+    datamodule = MultiVIMappedCollectionDataModule(
+        rna_collection=rna_collection,
+        atac_collection=atac_collection,
+        batch_key="batch",
+        batch_size=4,
+        shuffle=False,
+        categorical_covariate_keys=None,
+    )
+
+    assert datamodule.n_cats_per_cov == []
+    model = _create_and_train_multivi_model(datamodule)
+    assert model.module.n_batch == 2
+    assert model.module.n_cats_per_cov == []
