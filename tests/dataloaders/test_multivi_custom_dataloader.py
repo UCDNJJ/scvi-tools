@@ -274,5 +274,10 @@ def test_multivi_custom_dataloader_no_extra_cat_covs_uses_batch_and_trains(tmp_p
 
     assert datamodule.n_cats_per_cov == []
     model = _create_and_train_multivi_model(datamodule)
+    assert model.is_trained
     assert model.module.n_batch == 2
     assert model.module.n_cats_per_cov == []
+    latent = model.get_latent_representation(
+        dataloader=datamodule.inference_dataloader(batch_size=4)
+    )
+    assert latent.shape == (datamodule.n_obs, 5)

@@ -506,8 +506,9 @@ class _CollectionBackedAnnData:
                 matrix = matrix.toarray()
             else:
                 matrix = np.asarray(matrix)
-            restore_order = np.argsort(sort_order)
-            matrix = matrix[restore_order]
+            inverse_order = np.empty_like(sort_order)
+            inverse_order[sort_order] = np.arange(len(sort_order))
+            matrix = matrix[inverse_order]
             out[np.asarray(positions, dtype=np.int64)] = matrix.astype(np.float32, copy=False)
         return out
 
