@@ -88,6 +88,25 @@ def _make_multivi_collections(tmp_path, fully_paired: bool):
     return rna_collection, atac_collection, sorted(set(obs_names)), missing_rna, missing_atac
 
 
+def _create_and_train_multivi_model(datamodule, modality_weights: str = "equal"):
+    model = scvi.model.MULTIVI(
+        adata=None,
+        registry=datamodule.registry,
+        n_latent=5,
+        n_hidden=16,
+        modality_weights=modality_weights,
+        encode_covariates=True,
+    )
+    model.train(
+        datamodule=datamodule,
+        max_epochs=1,
+        batch_size=4,
+        early_stopping=False,
+        adversarial_mixing=True,
+    )
+    return model
+
+
 @pytest.mark.dataloader
 @dependencies("lamindb")
 def test_multivi_custom_dataloader_registry_and_batch_shapes(tmp_path):
@@ -147,28 +166,95 @@ def test_multivi_custom_dataloader_train(tmp_path, fully_paired: bool, modality_
         continuous_covariate_keys=["score"],
     )
 
-    model = scvi.model.MULTIVI(
-        adata=None,
-        registry=datamodule.registry,
-        n_latent=5,
-        n_hidden=16,
-        modality_weights=modality_weights,
-        encode_covariates=True,
-    )
+    model = _create_and_train_multivi_model(datamodule, modality_weights=modality_weights)
     assert model.module is not None
     assert model.module.n_input_genes == datamodule.n_vars
     assert model.module.n_input_regions == datamodule.n_regions
     assert model.module.n_input_proteins == 0
 
-    model.train(
-        datamodule=datamodule,
-        max_epochs=1,
-        batch_size=4,
-        early_stopping=False,
-        adversarial_mixing=True,
+    latent = model.get_latent_representation(
+        dataloader=datamodule.inference_dataloader(batch_size=4)
     )
+    assert latent.shape == (datamodule.n_obs, 5)
+
+
+@pytest.mark.dataloader
+@pytest.mark.parametrize(
+    ("rna_only", "expected_n_obs", "expected_x_shape", "expected_atac_shape"),
+    [
+        (True, 8, (8, 12), (8, 0)),
+        (False, 8, (8, 0), (8, 8)),
+    ],
+)
+@dependencies("lamindb")
+def test_multivi_custom_dataloader_single_modality(
+    tmp_path,
+    rna_only,
+    expected_n_obs,
+    expected_x_shape,
+    expected_atac_shape,
+):
+    (
+        rna_collection,
+        atac_collection,
+        _,
+        _,
+        _,
+    ) = _make_multivi_collections(tmp_path, fully_paired=False)
+    present_collection = rna_collection if rna_only else atac_collection
+    present_obs_names = sorted(
+        {
+            obs_name
+            for artifact in present_collection.artifacts.all()
+            for obs_name in artifact.load().obs_names.astype(str)
+        }
+    )
+    datamodule = MultiVIMappedCollectionDataModule(
+        rna_collection=present_collection if rna_only else None,
+        atac_collection=None if rna_only else present_collection,
+        batch_key="batch",
+        batch_size=4,
+        shuffle=False,
+        categorical_covariate_keys=["site"],
+        continuous_covariate_keys=["score"],
+    )
+
+    assert datamodule.n_obs == expected_n_obs
+    assert datamodule.n_vars == (12 if rna_only else 0)
+    assert datamodule.n_regions == (0 if rna_only else 8)
+    assert np.array_equal(
+        datamodule._global_obs_names,
+        np.asarray(present_obs_names, dtype=object),
+    )
+    assert datamodule.registry["field_registries"][REGISTRY_KEYS.X_KEY]["state_registry"][
+        "column_names"
+    ].shape == (12 if rna_only else 0,)
+    assert datamodule.registry["field_registries"][REGISTRY_KEYS.ATAC_X_KEY]["state_registry"][
+        "column_names"
+    ].shape == (0 if rna_only else 8,)
+
+    batch = next(iter(datamodule.inference_dataloader(batch_size=expected_n_obs)))
+    assert batch[REGISTRY_KEYS.X_KEY].shape == expected_x_shape
+    assert batch[REGISTRY_KEYS.ATAC_X_KEY].shape == expected_atac_shape
+
+    model = _create_and_train_multivi_model(datamodule)
+    assert model.module.n_input_genes == datamodule.n_vars
+    assert model.module.n_input_regions == datamodule.n_regions
 
     latent = model.get_latent_representation(
         dataloader=datamodule.inference_dataloader(batch_size=4)
     )
     assert latent.shape == (datamodule.n_obs, 5)
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_multivi_custom_dataloader_requires_collection():
+    with pytest.raises(
+        ValueError,
+        match="At least one of `rna_collection` or `atac_collection` must be provided.",
+    ):
+        MultiVIMappedCollectionDataModule(
+            rna_collection=None,
+            atac_collection=None,
+        )

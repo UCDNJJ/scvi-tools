@@ -554,8 +554,8 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
     @dependencies("lamindb")
     def __init__(
         self,
-        rna_collection: ln.Collection,
-        atac_collection: ln.Collection,
+        rna_collection: ln.Collection | None = None,
+        atac_collection: ln.Collection | None = None,
         batch_key: str | None = None,
         batch_size: int = 128,
         shuffle: bool = True,
@@ -563,6 +563,10 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         continuous_covariate_keys: list[str] | None = None,
     ):
         super().__init__()
+        if rna_collection is None and atac_collection is None:
+            raise ValueError(
+                "At least one of `rna_collection` or `atac_collection` must be provided."
+            )
         self._batch_key = batch_key
         self._batch_size = batch_size
         self.shuffle = shuffle
@@ -578,13 +582,23 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         if continuous_covariate_keys is not None:
             obs_columns.extend(continuous_covariate_keys)
 
-        self._rna_source = _CollectionBackedAnnData(rna_collection, obs_columns)
-        self._atac_source = _CollectionBackedAnnData(atac_collection, obs_columns)
+        self._rna_source = (
+            _CollectionBackedAnnData(rna_collection, obs_columns)
+            if rna_collection is not None
+            else None
+        )
+        self._atac_source = (
+            _CollectionBackedAnnData(atac_collection, obs_columns)
+            if atac_collection is not None
+            else None
+        )
+        self._sources = tuple(
+            source for source in (self._rna_source, self._atac_source) if source is not None
+        )
+        obs_name_sets = [set(source.obs_to_location) for source in self._sources]
 
         self._global_obs_names = np.array(
-            sorted(
-                set(self._rna_source.obs_to_location).union(self._atac_source.obs_to_location),
-            ),
+            sorted(set.union(*obs_name_sets)),
             dtype=object,
         )
         self._metadata = self._build_metadata()
@@ -592,8 +606,8 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         self._dataset = _IndexDataset(np.arange(self.n_obs, dtype=np.int64))
 
     def close(self):
-        self._rna_source.close()
-        self._atac_source.close()
+        for source in self._sources:
+            source.close()
 
     @property
     def n_obs(self) -> int:
@@ -601,18 +615,26 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
 
     @property
     def var_names(self) -> np.ndarray:
+        if self._rna_source is None:
+            return np.asarray([], dtype=object)
         return self._rna_source.var_names
 
     @property
     def n_vars(self) -> int:
+        if self._rna_source is None:
+            return 0
         return self._rna_source.n_vars
 
     @property
     def region_names(self) -> np.ndarray:
+        if self._atac_source is None:
+            return np.asarray([], dtype=object)
         return self._atac_source.var_names
 
     @property
     def n_regions(self) -> int:
+        if self._atac_source is None:
+            return 0
         return self._atac_source.n_vars
 
     @property
@@ -774,7 +796,7 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         metadata: dict[str, dict[str, object]] = {}
         for obs_name in self._global_obs_names:
             values = {}
-            for source in (self._rna_source, self._atac_source):
+            for source in self._sources:
                 source_values = source.obs_metadata.get(obs_name)
                 if source_values is None:
                     continue
@@ -851,12 +873,24 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
             collate_fn=self._collate_fn,
         )
 
+    @staticmethod
+    def _fetch_modality_tensor(
+        source: _CollectionBackedAnnData | None, obs_names: np.ndarray
+    ) -> torch.Tensor:
+        matrix = (
+            source.fetch_rows(obs_names)
+            if source is not None
+            else np.zeros((len(obs_names), 0), dtype=np.float32)
+        )
+        return torch.from_numpy(matrix)
+
     def _collate_fn(self, batch_indices: list[int]) -> dict[str, torch.Tensor | None]:
         indices = np.asarray(batch_indices, dtype=np.int64)
         obs_names = self._global_obs_names[indices]
-        atac_tensor = torch.from_numpy(self._atac_source.fetch_rows(obs_names))
+        rna_tensor = self._fetch_modality_tensor(self._rna_source, obs_names)
+        atac_tensor = self._fetch_modality_tensor(self._atac_source, obs_names)
         batch = {
-            REGISTRY_KEYS.X_KEY: torch.from_numpy(self._rna_source.fetch_rows(obs_names)),
+            REGISTRY_KEYS.X_KEY: rna_tensor,
             REGISTRY_KEYS.ATAC_X_KEY: atac_tensor,
             # Keep the explicit `atac_X` alias for the custom-dataloader contract alongside the
             # canonical REGISTRY_KEYS.ATAC_X_KEY (`atac`) key used internally by MULTIVAE.
