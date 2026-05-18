@@ -161,6 +161,7 @@ class BaseModelClass(metaclass=BaseModelMetaClass):
         elif (
             (self.__class__.__name__ == "GIMVI")
             or (self.__class__.__name__ == "SCVI")
+            or (self.__class__.__name__ == "MULTIVI")
             or (self.__class__.__name__ == "DIAGVI")
         ):
             # note some models do accept empty registry/adata (e.g: gimvi)

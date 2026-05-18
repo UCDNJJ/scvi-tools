@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import os
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
+import anndata as ad
 import numpy as np
 import torch
 from lightning.pytorch import LightningDataModule
+from scipy.sparse import issparse
 from sklearn.preprocessing import LabelEncoder
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 import scvi
+from scvi import REGISTRY_KEYS
 from scvi.model._utils import parse_device_args
 from scvi.utils import dependencies
 
@@ -19,6 +23,7 @@ if TYPE_CHECKING:
     import lamindb as ln
     import pandas as pd
     import tiledbsoma as soma
+    from anndata import AnnData
 
 
 class MappedCollectionDataModule(LightningDataModule):
@@ -432,6 +437,443 @@ class MappedCollectionDataModule(LightningDataModule):
 
         def __len__(self):
             return len(self.dataloader)
+
+
+class _IndexDataset(Dataset):
+    def __init__(self, indices: np.ndarray):
+        self.indices = np.asarray(indices, dtype=np.int64)
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, index: int) -> int:
+        return int(self.indices[index])
+
+
+class _CollectionBackedAnnData:
+    def __init__(
+        self,
+        collection: ln.Collection,
+        obs_columns: list[str],
+    ):
+        self._artifacts = list(collection.artifacts.all())
+        self._obs_columns = list(dict.fromkeys(obs_columns))
+        self._adatas: list[AnnData] = []
+        self.obs_to_location: dict[str, tuple[int, int]] = {}
+        self.obs_metadata: dict[str, dict[str, object]] = {}
+        self.var_names: np.ndarray | None = None
+
+        for artifact_idx, artifact in enumerate(self._artifacts):
+            adata = self._open_artifact(artifact)
+            self._adatas.append(adata)
+            self._register_var_names(adata)
+            self._register_obs(artifact_idx, adata)
+
+        if self.var_names is None:
+            self.var_names = np.asarray([], dtype=object)
+
+    @property
+    def n_vars(self) -> int:
+        return len(self.var_names)
+
+    def close(self) -> None:
+        for adata in self._adatas:
+            file_manager = getattr(adata, "file", None)
+            if file_manager is not None:
+                try:
+                    file_manager.close()
+                except (AttributeError, OSError, ValueError):
+                    pass
+
+    def fetch_rows(self, obs_names: np.ndarray) -> np.ndarray:
+        out = np.zeros((len(obs_names), self.n_vars), dtype=np.float32)
+        row_positions: dict[int, list[int]] = defaultdict(list)
+        row_indices: dict[int, list[int]] = defaultdict(list)
+        for out_idx, obs_name in enumerate(obs_names):
+            location = self.obs_to_location.get(str(obs_name))
+            if location is None:
+                continue
+            artifact_idx, row_idx = location
+            row_positions[artifact_idx].append(out_idx)
+            row_indices[artifact_idx].append(row_idx)
+
+        for artifact_idx, positions in row_positions.items():
+            matrix = self._adatas[artifact_idx][row_indices[artifact_idx]].X
+            if issparse(matrix):
+                matrix = matrix.toarray()
+            else:
+                matrix = np.asarray(matrix)
+            out[np.asarray(positions, dtype=np.int64)] = matrix.astype(np.float32, copy=False)
+        return out
+
+    @staticmethod
+    def _open_artifact(artifact) -> AnnData:
+        path = _CollectionBackedAnnData._get_artifact_path(artifact)
+        if path is not None:
+            return ad.read_h5ad(path, backed="r")
+        return artifact.load()
+
+    @staticmethod
+    def _get_artifact_path(artifact) -> str | None:
+        for attr in ("path", "local_filepath"):
+            value = getattr(artifact, attr, None)
+            if value is not None:
+                return os.fspath(value)
+        cache = getattr(artifact, "cache", None)
+        if callable(cache):
+            try:
+                cached = cache()
+            except TypeError:
+                cached = None
+            if cached is not None:
+                return os.fspath(cached)
+        return None
+
+    def _register_var_names(self, adata: AnnData) -> None:
+        var_names = np.asarray(adata.var_names, dtype=object)
+        if self.var_names is None:
+            self.var_names = var_names
+        elif not np.array_equal(self.var_names, var_names):
+            raise ValueError(
+                "All artifacts in a modality collection must share the same var_names."
+            )
+
+    def _register_obs(self, artifact_idx: int, adata: AnnData) -> None:
+        obs_frame = adata.obs.reindex(columns=self._obs_columns, fill_value=None)
+        for row_idx, obs_name in enumerate(adata.obs_names.astype(str)):
+            if obs_name in self.obs_to_location:
+                raise ValueError(f"Duplicate obs_name {obs_name!r} found in collection.")
+            self.obs_to_location[obs_name] = (artifact_idx, row_idx)
+            self.obs_metadata[obs_name] = {
+                key: value.item() if hasattr(value, "item") else value
+                for key, value in obs_frame.iloc[row_idx].to_dict().items()
+            }
+
+
+class MultiVIMappedCollectionDataModule(LightningDataModule):
+    @dependencies("lamindb")
+    def __init__(
+        self,
+        rna_collection: ln.Collection,
+        atac_collection: ln.Collection,
+        batch_key: str | None = None,
+        batch_size: int = 128,
+        shuffle: bool = True,
+        categorical_covariate_keys: list[str] | None = None,
+        continuous_covariate_keys: list[str] | None = None,
+    ):
+        super().__init__()
+        self._batch_key = batch_key
+        self._batch_size = batch_size
+        self.shuffle = shuffle
+        self.model_name = "MULTIVI"
+        self._categorical_covariate_keys = categorical_covariate_keys
+        self._continuous_covariate_keys = continuous_covariate_keys
+        self._log_hyperparams = False
+        self.allow_zero_length_dataloader_with_multiple_devices = False
+
+        obs_columns = [batch_key] if batch_key is not None else []
+        if categorical_covariate_keys is not None:
+            obs_columns.extend(categorical_covariate_keys)
+        if continuous_covariate_keys is not None:
+            obs_columns.extend(continuous_covariate_keys)
+
+        self._rna_source = _CollectionBackedAnnData(rna_collection, obs_columns)
+        self._atac_source = _CollectionBackedAnnData(atac_collection, obs_columns)
+
+        self._global_obs_names = np.array(
+            sorted(
+                set(self._rna_source.obs_to_location).union(self._atac_source.obs_to_location),
+            ),
+            dtype=object,
+        )
+        self._metadata = self._build_metadata()
+        self._init_encoders()
+        self._dataset = _IndexDataset(np.arange(self.n_obs, dtype=np.int64))
+
+    def close(self):
+        self._rna_source.close()
+        self._atac_source.close()
+
+    @property
+    def n_obs(self) -> int:
+        return len(self._global_obs_names)
+
+    @property
+    def var_names(self) -> np.ndarray:
+        return self._rna_source.var_names
+
+    @property
+    def n_vars(self) -> int:
+        return self._rna_source.n_vars
+
+    @property
+    def region_names(self) -> np.ndarray:
+        return self._atac_source.var_names
+
+    @property
+    def n_regions(self) -> int:
+        return self._atac_source.n_vars
+
+    @property
+    def n_batch(self) -> int:
+        return 1 if self._batch_key is None else len(self.batch_labels)
+
+    @property
+    def n_labels(self) -> int:
+        return 1
+
+    @property
+    def n_cats_per_cov(self) -> list[int] | None:
+        if self._categorical_covariate_keys is None:
+            return None
+        return [len(encoder.classes_) for encoder in self._categorical_covariate_encoders]
+
+    @property
+    def n_continuous_cov(self) -> int:
+        if self._continuous_covariate_keys is None:
+            return 0
+        return len(self._continuous_covariate_keys)
+
+    @property
+    def batch_labels(self) -> np.ndarray:
+        if self._batch_key is None:
+            return np.array(["batch_0"], dtype=object)
+        return self._batch_encoder.classes_.astype(object)
+
+    @property
+    def labels(self) -> np.ndarray:
+        return np.array(["label_0"], dtype=object)
+
+    @property
+    def extra_categorical_covs(self) -> dict:
+        if self._categorical_covariate_keys is None:
+            return {
+                "data_registry": {},
+                "state_registry": {},
+                "summary_stats": {"n_extra_categorical_covs": 0},
+            }
+        mapping = dict(
+            zip(
+                self._categorical_covariate_keys,
+                [
+                    encoder.classes_.astype(object)
+                    for encoder in self._categorical_covariate_encoders
+                ],
+                strict=False,
+            )
+        )
+        return {
+            "data_registry": {"attr_key": "_scvi_extra_categorical_covs", "attr_name": "obsm"},
+            "state_registry": {
+                "field_keys": self._categorical_covariate_keys,
+                "mapping": mapping,
+                "n_cats_per_key": self.n_cats_per_cov,
+            },
+            "summary_stats": {"n_extra_categorical_covs": len(self._categorical_covariate_keys)},
+        }
+
+    @property
+    def extra_continuous_covs(self) -> dict:
+        if self._continuous_covariate_keys is None:
+            return {
+                "data_registry": {},
+                "state_registry": {},
+                "summary_stats": {"n_extra_continuous_covs": 0},
+            }
+        return {
+            "data_registry": {"attr_key": "_scvi_extra_continuous_covs", "attr_name": "obsm"},
+            "state_registry": {"columns": np.array(self._continuous_covariate_keys, dtype=object)},
+            "summary_stats": {"n_extra_continuous_covs": len(self._continuous_covariate_keys)},
+        }
+
+    @property
+    def registry(self) -> dict:
+        return {
+            "scvi_version": scvi.__version__,
+            "model_name": self.model_name,
+            "setup_args": {
+                "layer": None,
+                "batch_key": self._batch_key,
+                "labels_key": None,
+                "size_factor_key": None,
+                "categorical_covariate_keys": self._categorical_covariate_keys,
+                "continuous_covariate_keys": self._continuous_covariate_keys,
+            },
+            "field_registries": {
+                REGISTRY_KEYS.X_KEY: {
+                    "data_registry": {"attr_name": "X", "attr_key": None},
+                    "state_registry": {
+                        "n_obs": self.n_obs,
+                        "n_vars": self.n_vars,
+                        "column_names": self.var_names,
+                    },
+                    "summary_stats": {"n_vars": self.n_vars, "n_cells": self.n_obs},
+                },
+                REGISTRY_KEYS.ATAC_X_KEY: {
+                    "data_registry": {"attr_name": "obsm", "attr_key": REGISTRY_KEYS.ATAC_X_KEY},
+                    "state_registry": {
+                        "n_obs": self.n_obs,
+                        "n_vars": self.n_regions,
+                        "column_names": self.region_names,
+                    },
+                    "summary_stats": {"n_atac": self.n_regions},
+                },
+                REGISTRY_KEYS.BATCH_KEY: {
+                    "data_registry": {"attr_name": "obs", "attr_key": "_scvi_batch"},
+                    "state_registry": {
+                        "categorical_mapping": self.batch_labels,
+                        "original_key": self._batch_key,
+                    },
+                    "summary_stats": {"n_batch": self.n_batch},
+                },
+                REGISTRY_KEYS.LABELS_KEY: {
+                    "data_registry": {"attr_name": "obs", "attr_key": "_scvi_labels"},
+                    "state_registry": {
+                        "categorical_mapping": self.labels,
+                        "original_key": None,
+                        "unlabeled_category": None,
+                    },
+                    "summary_stats": {"n_labels": self.n_labels},
+                },
+                REGISTRY_KEYS.INDICES_KEY: {
+                    "data_registry": {"attr_name": "obs", "attr_key": "_indices"},
+                    "state_registry": {},
+                    "summary_stats": {},
+                },
+                REGISTRY_KEYS.SIZE_FACTOR_KEY: {
+                    "data_registry": {},
+                    "state_registry": {},
+                    "summary_stats": {},
+                },
+                REGISTRY_KEYS.CAT_COVS_KEY: self.extra_categorical_covs,
+                REGISTRY_KEYS.CONT_COVS_KEY: self.extra_continuous_covs,
+            },
+            "setup_method_name": "setup_datamodule",
+        }
+
+    def train_dataloader(self) -> DataLoader:
+        return self._create_dataloader(self._dataset, shuffle=self.shuffle)
+
+    def val_dataloader(self) -> DataLoader | None:
+        return None
+
+    def inference_dataloader(
+        self,
+        shuffle: bool = False,
+        batch_size: int | None = None,
+        indices=None,
+    ):
+        if indices is None:
+            dataset = self._dataset
+        else:
+            dataset = _IndexDataset(np.asarray(indices, dtype=np.int64))
+        return self._create_dataloader(dataset, shuffle=shuffle, batch_size=batch_size)
+
+    def _build_metadata(self) -> dict[str, dict[str, object]]:
+        metadata: dict[str, dict[str, object]] = {}
+        for obs_name in self._global_obs_names:
+            values = {}
+            for source in (self._rna_source, self._atac_source):
+                source_values = source.obs_metadata.get(obs_name)
+                if source_values is None:
+                    continue
+                for key, value in source_values.items():
+                    if key not in values or values[key] is None:
+                        values[key] = value
+                    elif value is not None and values[key] != value:
+                        raise ValueError(
+                            f"Conflicting obs metadata for {obs_name!r} and key {key!r}."
+                        )
+            metadata[obs_name] = values
+        return metadata
+
+    def _init_encoders(self) -> None:
+        if self._batch_key is None:
+            self._batch_codes = np.zeros(self.n_obs, dtype=np.int64)
+            self._batch_encoder = None
+        else:
+            batch_values = np.array(
+                [
+                    str(self._metadata[obs_name][self._batch_key])
+                    for obs_name in self._global_obs_names
+                ],
+                dtype=object,
+            )
+            self._batch_encoder = LabelEncoder().fit(batch_values)
+            self._batch_codes = self._batch_encoder.transform(batch_values).astype(np.int64)
+
+        if self._categorical_covariate_keys is None:
+            self._categorical_covariate_encoders = []
+            self._categorical_covariates = None
+        else:
+            self._categorical_covariate_encoders = []
+            cat_covs = np.zeros(
+                (self.n_obs, len(self._categorical_covariate_keys)),
+                dtype=np.int64,
+            )
+            for cov_idx, key in enumerate(self._categorical_covariate_keys):
+                values = np.array(
+                    [str(self._metadata[obs_name][key]) for obs_name in self._global_obs_names],
+                    dtype=object,
+                )
+                encoder = LabelEncoder().fit(values)
+                self._categorical_covariate_encoders.append(encoder)
+                cat_covs[:, cov_idx] = encoder.transform(values)
+            self._categorical_covariates = cat_covs
+
+        if self._continuous_covariate_keys is None:
+            self._continuous_covariates = None
+        else:
+            self._continuous_covariates = np.asarray(
+                [
+                    [
+                        float(self._metadata[obs_name][key])
+                        for key in self._continuous_covariate_keys
+                    ]
+                    for obs_name in self._global_obs_names
+                ],
+                dtype=np.float32,
+            )
+
+    def _create_dataloader(
+        self,
+        dataset: Dataset,
+        shuffle: bool,
+        batch_size: int | None = None,
+    ) -> DataLoader:
+        if batch_size is None:
+            batch_size = self._batch_size
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            collate_fn=self._collate_fn,
+        )
+
+    def _collate_fn(self, batch_indices: list[int]) -> dict[str, torch.Tensor | None]:
+        indices = np.asarray(batch_indices, dtype=np.int64)
+        obs_names = self._global_obs_names[indices]
+        atac_tensor = torch.from_numpy(self._atac_source.fetch_rows(obs_names))
+        batch = {
+            REGISTRY_KEYS.X_KEY: torch.from_numpy(self._rna_source.fetch_rows(obs_names)),
+            REGISTRY_KEYS.ATAC_X_KEY: atac_tensor,
+            "atac_X": atac_tensor,
+            REGISTRY_KEYS.BATCH_KEY: torch.from_numpy(self._batch_codes[indices][:, None]),
+            REGISTRY_KEYS.LABELS_KEY: torch.zeros((len(indices), 1), dtype=torch.int64),
+            REGISTRY_KEYS.INDICES_KEY: torch.from_numpy(indices[:, None]),
+            REGISTRY_KEYS.CAT_COVS_KEY: (
+                torch.from_numpy(self._categorical_covariates[indices])
+                if self._categorical_covariates is not None
+                else None
+            ),
+            REGISTRY_KEYS.CONT_COVS_KEY: (
+                torch.from_numpy(self._continuous_covariates[indices])
+                if self._continuous_covariates is not None
+                else None
+            ),
+        }
+        return batch
 
 
 class TileDBDataModule(LightningDataModule):
