@@ -660,7 +660,7 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
                     encoder.classes_.astype(object)
                     for encoder in self._categorical_covariate_encoders
                 ],
-                strict=False,
+                strict=True,
             )
         )
         return {
@@ -858,6 +858,8 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         batch = {
             REGISTRY_KEYS.X_KEY: torch.from_numpy(self._rna_source.fetch_rows(obs_names)),
             REGISTRY_KEYS.ATAC_X_KEY: atac_tensor,
+            # Keep the explicit `atac_X` alias for the custom-dataloader contract alongside the
+            # canonical REGISTRY_KEYS.ATAC_X_KEY (`atac`) key used internally by MULTIVAE.
             "atac_X": atac_tensor,
             REGISTRY_KEYS.BATCH_KEY: torch.from_numpy(self._batch_codes[indices][:, None]),
             REGISTRY_KEYS.LABELS_KEY: torch.zeros((len(indices), 1), dtype=torch.int64),

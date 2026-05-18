@@ -192,7 +192,8 @@ class MULTIVI(
             self.module = None
             warnings.warn(
                 "Model was initialized without `adata` or `registry`. The module will be "
-                "initialized when calling `train` with a datamodule.",
+                "initialized when calling `train` with a datamodule. You must pass "
+                "`datamodule=...` to `train()` for this initialization path.",
                 UserWarning,
                 stacklevel=settings.warnings_stacklevel,
             )
@@ -233,7 +234,7 @@ class MULTIVI(
                     else None
                 )
                 use_size_factor_key = bool(
-                    self.registry_["setup_args"].get(f"{REGISTRY_KEYS.SIZE_FACTOR_KEY}_key")
+                    self.registry["setup_args"].get(f"{REGISTRY_KEYS.SIZE_FACTOR_KEY}_key")
                 )
                 n_obs = field_registries[REGISTRY_KEYS.X_KEY]["state_registry"]["n_obs"]
 
@@ -360,7 +361,8 @@ class MULTIVI(
         if datamodule is None:
             if self.module is None:
                 raise ValueError(
-                    "A datamodule must be provided when MULTIVI is initialized without data."
+                    "A datamodule must be provided as `train(datamodule=...)` when MULTIVI "
+                    "is initialized without `adata` or `registry`."
                 )
             data_splitter = self._data_splitter_cls(
                 self.adata_manager,
