@@ -88,7 +88,7 @@ def _make_multivi_collections(tmp_path, fully_paired: bool):
     return rna_collection, atac_collection, sorted(set(obs_names)), missing_rna, missing_atac
 
 
-def _train_multivi(datamodule, modality_weights: str = "equal"):
+def _train_multivi_model(datamodule, modality_weights: str = "equal"):
     model = scvi.model.MULTIVI(
         adata=None,
         registry=datamodule.registry,
@@ -166,7 +166,7 @@ def test_multivi_custom_dataloader_train(tmp_path, fully_paired: bool, modality_
         continuous_covariate_keys=["score"],
     )
 
-    model = _train_multivi(datamodule, modality_weights=modality_weights)
+    model = _train_multivi_model(datamodule, modality_weights=modality_weights)
     assert model.module is not None
     assert model.module.n_input_genes == datamodule.n_vars
     assert model.module.n_input_regions == datamodule.n_regions
@@ -198,8 +198,8 @@ def test_multivi_custom_dataloader_single_modality(
         rna_collection,
         atac_collection,
         _,
-        _missing_rna,
-        _missing_atac,
+        _,
+        _,
     ) = _make_multivi_collections(tmp_path, fully_paired=False)
     present_collection = rna_collection if rna_only else atac_collection
     present_obs_names = sorted(
@@ -237,7 +237,7 @@ def test_multivi_custom_dataloader_single_modality(
     assert batch[REGISTRY_KEYS.X_KEY].shape == expected_x_shape
     assert batch[REGISTRY_KEYS.ATAC_X_KEY].shape == expected_atac_shape
 
-    model = _train_multivi(datamodule)
+    model = _train_multivi_model(datamodule)
     assert model.module.n_input_genes == datamodule.n_vars
     assert model.module.n_input_regions == datamodule.n_regions
 

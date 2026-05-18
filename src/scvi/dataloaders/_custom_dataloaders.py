@@ -595,9 +595,10 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         self._sources = tuple(
             source for source in (self._rna_source, self._atac_source) if source is not None
         )
+        obs_name_sets = [source.obs_to_location for source in self._sources]
 
         self._global_obs_names = np.array(
-            sorted(set().union(*(source.obs_to_location for source in self._sources))),
+            sorted(set().union(*obs_name_sets)),
             dtype=object,
         )
         self._metadata = self._build_metadata()
@@ -872,19 +873,22 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
             collate_fn=self._collate_fn,
         )
 
+    @staticmethod
+    def _fetch_modality_tensor(
+        source: _CollectionBackedAnnData | None, obs_names: np.ndarray
+    ) -> torch.Tensor:
+        matrix = (
+            source.fetch_rows(obs_names)
+            if source is not None
+            else np.zeros((len(obs_names), 0), dtype=np.float32)
+        )
+        return torch.from_numpy(matrix)
+
     def _collate_fn(self, batch_indices: list[int]) -> dict[str, torch.Tensor | None]:
         indices = np.asarray(batch_indices, dtype=np.int64)
         obs_names = self._global_obs_names[indices]
-        rna_tensor = torch.from_numpy(
-            self._rna_source.fetch_rows(obs_names)
-            if self._rna_source is not None
-            else np.zeros((len(indices), 0), dtype=np.float32)
-        )
-        atac_tensor = torch.from_numpy(
-            self._atac_source.fetch_rows(obs_names)
-            if self._atac_source is not None
-            else np.zeros((len(indices), 0), dtype=np.float32)
-        )
+        rna_tensor = self._fetch_modality_tensor(self._rna_source, obs_names)
+        atac_tensor = self._fetch_modality_tensor(self._atac_source, obs_names)
         batch = {
             REGISTRY_KEYS.X_KEY: rna_tensor,
             REGISTRY_KEYS.ATAC_X_KEY: atac_tensor,
