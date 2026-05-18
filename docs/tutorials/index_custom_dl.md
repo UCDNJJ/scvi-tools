@@ -6,6 +6,7 @@
 notebooks/custom_dl/tiledb
 notebooks/custom_dl/lamin
 notebooks/custom_dl/ann_collection
+multivi_atac_lamin
 notebooks/custom_dl/Tahoe100_mrVI_lamin
 ```
 
@@ -28,6 +29,13 @@ Use the Lamin MappedCollectionDataModule for a scalable approach to training an 
 :tags: Analysis, Custom-Dataloaders, Integration, Dev
 
 Use the AnnCollection dataloader for a scalable approach to training an scVI model on multiple adata's.
+```
+
+```{customcard}
+:path: multivi_atac_lamin
+:tags: Analysis, Custom-Dataloaders, Integration, Dev
+
+Create an ATAC-only Lamin collection and train MultiVI with `MultiVIMappedCollectionDataModule`.
 ```
 
 ```{customcard}

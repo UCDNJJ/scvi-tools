@@ -551,6 +551,53 @@ class _CollectionBackedAnnData:
 
 
 class MultiVIMappedCollectionDataModule(LightningDataModule):
+    """Data module for training :class:`~scvi.model.MULTIVI` from Lamin collections.
+
+    The module reads RNA and/or ATAC AnnData artifacts from Lamin collections and exposes
+    a datamodule interface compatible with :meth:`~scvi.model.MULTIVI.train`.
+
+    Parameters
+    ----------
+    rna_collection
+        Lamin collection containing RNA AnnData artifacts. Can be ``None`` when training
+        from ATAC-only data.
+    atac_collection
+        Lamin collection containing ATAC AnnData artifacts. Can be ``None`` when training
+        from RNA-only data.
+    batch_key
+        Optional obs key used for batches.
+    batch_size
+        Minibatch size.
+    shuffle
+        Whether to shuffle the training dataloader.
+    categorical_covariate_keys
+        Optional list of obs keys for categorical covariates.
+    continuous_covariate_keys
+        Optional list of obs keys for continuous covariates.
+
+    Notes
+    -----
+    At least one of ``rna_collection`` or ``atac_collection`` must be provided.
+
+    Examples
+    --------
+    >>> import lamindb as ln
+    >>> from scvi.dataloaders import MultiVIMappedCollectionDataModule
+    >>> from scvi.model import MULTIVI
+    >>> atac_collection = ln.Collection.get(name="my_atac_collection")
+    >>> datamodule = MultiVIMappedCollectionDataModule(
+    ...     rna_collection=None,
+    ...     atac_collection=atac_collection,
+    ...     batch_key="batch",
+    ...     batch_size=128,
+    ... )
+    >>> model = MULTIVI(adata=None, registry=datamodule.registry, modality_weights="equal")
+    >>> model.train(datamodule=datamodule, max_epochs=10)
+    >>> latent = model.get_latent_representation(
+    ...     dataloader=datamodule.inference_dataloader(batch_size=128)
+    ... )
+    """
+
     @dependencies("lamindb")
     def __init__(
         self,
