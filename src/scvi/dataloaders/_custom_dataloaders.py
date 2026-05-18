@@ -595,10 +595,10 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         self._sources = tuple(
             source for source in (self._rna_source, self._atac_source) if source is not None
         )
-        obs_name_sets = [source.obs_to_location for source in self._sources]
+        obs_name_sets = [set(source.obs_to_location) for source in self._sources]
 
         self._global_obs_names = np.array(
-            sorted(set().union(*obs_name_sets)),
+            sorted(set.union(*obs_name_sets)),
             dtype=object,
         )
         self._metadata = self._build_metadata()
