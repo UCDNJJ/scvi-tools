@@ -64,6 +64,12 @@ class MULTIVI(
     ----------
     adata
         MuData object that has been registered via :meth:`~scvi.model.MULTIVI.setup_mudata`.
+        Can be ``None`` when initializing from a precomputed ``registry`` and training with
+        ``train(datamodule=...)``.
+    registry
+        Registry dictionary produced by a compatible datamodule (for example,
+        :class:`~scvi.dataloaders.MultiVIMappedCollectionDataModule`). Use this when
+        ``adata`` is ``None``.
     n_genes
         The number of gene expression features (genes).
     n_regions
@@ -127,6 +133,13 @@ class MULTIVI(
     >>>             "atac_layer": "atac"})
     >>> vae = scvi.model.MULTIVI(mdata)
     >>> vae.train()
+    >>> datamodule = scvi.dataloaders.MultiVIMappedCollectionDataModule(
+    ...     rna_collection=None,
+    ...     atac_collection=atac_collection,
+    ...     batch_key="batch",
+    ... )
+    >>> vae = scvi.model.MULTIVI(adata=None, registry=datamodule.registry)
+    >>> vae.train(datamodule=datamodule)
 
     Notes (for using setup_anndata)
     ---------------------------------
@@ -141,7 +154,8 @@ class MULTIVI(
 
     def __init__(
         self,
-        adata: AnnOrMuData,
+        adata: AnnOrMuData | None = None,
+        registry: dict | None = None,
         n_genes: int | None = None,
         n_regions: int | None = None,
         modality_weights: Literal["equal", "cell", "universal"] = "equal",
@@ -163,67 +177,100 @@ class MULTIVI(
         protein_dispersion: Literal["protein", "protein-batch", "protein-label"] = "protein",
         **model_kwargs,
     ):
-        super().__init__(adata)
-        if "n_proteins" in self.summary_stats:
-            self.protein_state_registry = self.adata_manager.get_state_registry(
-                REGISTRY_KEYS.PROTEIN_EXP_KEY
-            )
+        super().__init__(adata, registry)
 
-        if n_genes is None or n_regions is None:
-            assert isinstance(adata, MuData), (
-                "n_genes and n_regions must be provided if using AnnData"
-            )
-            n_genes = self.summary_stats.get("n_vars", 0)
-            n_regions = self.summary_stats.get("n_atac", 0)
-
-        prior_mean, prior_scale = None, None
-        n_cats_per_cov = (
-            self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY).n_cats_per_key
-            if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry
-            else []
-        )
-
-        use_size_factor_key = REGISTRY_KEYS.SIZE_FACTOR_KEY in self.adata_manager.data_registry
-
-        if "n_proteins" in self.summary_stats:
-            n_proteins = self.summary_stats.n_proteins
-        else:
-            n_proteins = 0
-
-        self.module = self._module_cls(
-            n_input_genes=n_genes,
-            n_input_regions=n_regions,
-            n_input_proteins=n_proteins,
-            modality_weights=modality_weights,
-            modality_penalty=modality_penalty,
-            n_batch=self.summary_stats.n_batch,
-            n_obs=adata.n_obs,
-            n_hidden=n_hidden,
-            n_latent=n_latent,
-            n_layers_encoder=n_layers_encoder,
-            n_layers_decoder=n_layers_decoder,
-            n_continuous_cov=self.summary_stats.get("n_extra_continuous_covs", 0),
-            n_cats_per_cov=n_cats_per_cov,
-            dropout_rate=dropout_rate,
-            region_factors=region_factors,
-            gene_likelihood=gene_likelihood,
-            gene_dispersion=dispersion,
-            use_batch_norm=use_batch_norm,
-            use_layer_norm=use_layer_norm,
-            use_size_factor_key=use_size_factor_key,
-            latent_distribution=latent_distribution,
-            deeply_inject_covariates=deeply_inject_covariates,
-            encode_covariates=encode_covariates,
-            protein_background_prior_mean=prior_mean,
-            protein_background_prior_scale=prior_scale,
-            protein_dispersion=protein_dispersion,
+        self._module_kwargs = {
+            "modality_weights": modality_weights,
+            "modality_penalty": modality_penalty,
+            "n_hidden": n_hidden,
+            "n_latent": n_latent,
+            "n_layers_encoder": n_layers_encoder,
+            "n_layers_decoder": n_layers_decoder,
+            "dropout_rate": dropout_rate,
+            "region_factors": region_factors,
+            "gene_likelihood": gene_likelihood,
+            "gene_dispersion": dispersion,
+            "use_batch_norm": use_batch_norm,
+            "use_layer_norm": use_layer_norm,
+            "latent_distribution": latent_distribution,
+            "deeply_inject_covariates": deeply_inject_covariates,
+            "encode_covariates": encode_covariates,
+            "protein_background_prior_mean": None,
+            "protein_background_prior_scale": None,
+            "protein_dispersion": protein_dispersion,
             **model_kwargs,
+        }
+
+        if self._module_init_on_train:
+            self.module = None
+            warnings.warn(
+                "Model was initialized without `adata` or `registry`. The module will be "
+                "initialized when calling `train` with a datamodule. You must pass "
+                "`datamodule=...` to `train()` for this initialization path.",
+                UserWarning,
+                stacklevel=settings.warnings_stacklevel,
+            )
+        else:
+            if adata is not None and "n_proteins" in self.summary_stats:
+                self.protein_state_registry = self.adata_manager.get_state_registry(
+                    REGISTRY_KEYS.PROTEIN_EXP_KEY
+                )
+
+            field_registries = self.registry["field_registries"]
+            if n_genes is None or n_regions is None:
+                if adata is not None and isinstance(adata, MuData):
+                    n_genes = self.summary_stats.get("n_vars", 0)
+                    n_regions = self.summary_stats.get("n_atac", 0)
+                else:
+                    n_genes = field_registries[REGISTRY_KEYS.X_KEY]["state_registry"]["n_vars"]
+                    n_regions = field_registries[REGISTRY_KEYS.ATAC_X_KEY]["state_registry"][
+                        "n_vars"
+                    ]
+
+            if adata is not None:
+                n_cats_per_cov = (
+                    self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY).n_cats_per_key
+                    if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry
+                    else []
+                )
+                use_size_factor_key = (
+                    REGISTRY_KEYS.SIZE_FACTOR_KEY in self.adata_manager.data_registry
+                )
+                n_obs = adata.n_obs
+            else:
+                cat_cov_state_registry = field_registries[REGISTRY_KEYS.CAT_COVS_KEY][
+                    "state_registry"
+                ]
+                n_cats_per_cov = (
+                    tuple(cat_cov_state_registry["n_cats_per_key"])
+                    if len(cat_cov_state_registry) > 0
+                    else ()
+                )
+                use_size_factor_key = bool(
+                    self.registry["setup_args"].get(f"{REGISTRY_KEYS.SIZE_FACTOR_KEY}_key")
+                )
+                n_obs = field_registries[REGISTRY_KEYS.X_KEY]["state_registry"]["n_obs"]
+
+            n_proteins = self.summary_stats.get("n_proteins", 0)
+            self.module = self._module_cls(
+                n_input_genes=n_genes,
+                n_input_regions=n_regions,
+                n_input_proteins=n_proteins,
+                n_batch=self.summary_stats.n_batch,
+                n_obs=n_obs,
+                n_continuous_cov=self.summary_stats.get("n_extra_continuous_covs", 0),
+                n_cats_per_cov=n_cats_per_cov,
+                use_size_factor_key=use_size_factor_key,
+                **self._module_kwargs,
+            )
+            self.module.minified_data_type = self.minified_data_type
+        protein_count = (
+            self.summary_stats.get("n_proteins", 0) if hasattr(self, "summary_stats") else 0
         )
-        self.module.minified_data_type = self.minified_data_type
         self._model_summary_string = (
             f"MultiVI Model with the following params: \nn_genes: {n_genes}, "
-            f"n_regions: {n_regions}, n_proteins: {n_proteins}, n_hidden: {self.module.n_hidden}, "
-            f"n_latent: {self.module.n_latent}, n_layers_encoder: {n_layers_encoder}, "
+            f"n_regions: {n_regions}, n_proteins: {protein_count}, "
+            f"n_hidden: {n_hidden}, n_latent: {n_latent}, n_layers_encoder: {n_layers_encoder}, "
             f"n_layers_decoder: {n_layers_decoder}, dropout_rate: {dropout_rate}, "
             f"latent_distribution: {latent_distribution}, "
             f"deep injection: {deeply_inject_covariates}, gene_likelihood: {gene_likelihood}, "
@@ -235,7 +282,7 @@ class MULTIVI(
         self.init_params_ = self._get_init_params(locals())
         self.n_genes = n_genes
         self.n_regions = n_regions
-        self.n_proteins = n_proteins
+        self.n_proteins = protein_count
         self.get_normalized_function_name = "get_normalized_accessibility"
 
     @devices_dsp.dedent
@@ -258,6 +305,7 @@ class MULTIVI(
         adversarial_mixing: bool = True,
         datasplitter_kwargs: dict | None = None,
         plan_kwargs: dict | None = None,
+        datamodule=None,
         **kwargs,
     ):
         """Trains the model using amortized variational inference.
@@ -280,13 +328,16 @@ class MULTIVI(
             are split in the sequential order of the data according to `validation_size` and
             `train_size` percentages.
         batch_size
-            Minibatch size to use during training.
+            Minibatch size to use during training. Ignored when ``datamodule`` is provided,
+            because batching is controlled by the external datamodule.
         weight_decay
             weight decay regularization term for optimization
         eps
             Optimizer eps
         early_stopping
-            Whether to perform early stopping with respect to the validation set.
+            Whether to perform early stopping with respect to the validation set. If
+            ``datamodule`` is provided and its ``val_dataloader()`` returns ``None``,
+            early stopping is automatically disabled.
         check_val_every_n_epoch
             Check val every n train epochs. By default, val is not checked, unless `early_stopping`
             is `True`. If so, val is checked every epoch.
@@ -305,6 +356,15 @@ class MULTIVI(
         plan_kwargs
             Keyword args for :class:`~scvi.train.TrainingPlan`. Keyword arguments passed to
             `train()` will overwrite values present in `plan_kwargs`, when appropriate.
+        datamodule
+            Optional datamodule that provides ``train_dataloader``, ``val_dataloader``,
+            and ``registry`` metadata for model initialization. This is required when
+            :class:`~scvi.model.MULTIVI` is initialized with ``adata=None`` and ``registry``.
+            For example, this enables ATAC-only training with
+            :class:`~scvi.dataloaders.MultiVIMappedCollectionDataModule` by passing
+            ``rna_collection=None`` and an ``atac_collection``.
+            When provided, ``train_size``, ``validation_size``, ``shuffle_set_split``,
+            and ``batch_size`` are ignored.
         **kwargs
             Other keyword args for :class:`~scvi.train.Trainer`.
         """
@@ -323,15 +383,47 @@ class MULTIVI(
 
         datasplitter_kwargs = datasplitter_kwargs or {}
 
-        data_splitter = self._data_splitter_cls(
-            self.adata_manager,
-            train_size=train_size,
-            validation_size=validation_size,
-            shuffle_set_split=shuffle_set_split,
-            distributed_sampler=use_distributed_sampler(kwargs.get("strategy", None)),
-            batch_size=batch_size or settings.batch_size,
-            **datasplitter_kwargs,
-        )
+        if datamodule is None:
+            if self.module is None:
+                raise ValueError(
+                    "A datamodule must be provided as `train(datamodule=...)` when MULTIVI "
+                    "is initialized without `adata` or `registry`."
+                )
+            data_splitter = self._data_splitter_cls(
+                self.adata_manager,
+                train_size=train_size,
+                validation_size=validation_size,
+                shuffle_set_split=shuffle_set_split,
+                distributed_sampler=use_distributed_sampler(kwargs.get("strategy", None)),
+                batch_size=batch_size or settings.batch_size,
+                **datasplitter_kwargs,
+            )
+        else:
+            if self.module is None:
+                self.module = self._module_cls(
+                    n_input_genes=datamodule.n_vars,
+                    n_input_regions=datamodule.n_regions,
+                    n_input_proteins=0,
+                    n_batch=datamodule.n_batch,
+                    n_obs=datamodule.n_obs,
+                    n_continuous_cov=getattr(datamodule, "n_continuous_cov", 0),
+                    n_cats_per_cov=getattr(datamodule, "n_cats_per_cov", None),
+                    **self._module_kwargs,
+                )
+                self.module.minified_data_type = self.minified_data_type
+                self.n_genes = datamodule.n_vars
+                self.n_regions = datamodule.n_regions
+                self.n_proteins = 0
+            val_dataloader = datamodule.val_dataloader()
+            if early_stopping and val_dataloader is None:
+                early_stopping = False
+                warnings.warn(
+                    "Disabled early stopping because the provided datamodule does not expose "
+                    "a validation dataloader.",
+                    UserWarning,
+                    stacklevel=settings.warnings_stacklevel,
+                )
+            data_splitter = datamodule
         training_plan = self._training_plan_cls(self.module, **plan_kwargs)
         runner = self._train_runner_cls(
             self,
