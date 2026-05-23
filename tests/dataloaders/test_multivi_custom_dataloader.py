@@ -35,6 +35,15 @@ class _FakeCollection:
         self.artifacts = _FakeArtifacts([_FakeArtifact(path) for path in paths])
 
 
+def _shutdown_workers(dataloader) -> None:
+    iterator = getattr(dataloader, "_iterator", None)
+    if iterator is not None:
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            shutdown()
+        dataloader._iterator = None
+
+
 def _write_collection_parts(tmp_path, prefix: str, adatas):
     paths = []
     for idx, adata in enumerate(adatas):
@@ -122,6 +131,7 @@ def test_multivi_custom_dataloader_registry_and_batch_shapes(tmp_path):
         batch_key="batch",
         batch_size=len(obs_names),
         shuffle=False,
+        parallel=False,
         categorical_covariate_keys=["site"],
         continuous_covariate_keys=["score"],
     )
@@ -161,6 +171,7 @@ def test_multivi_custom_dataloader_train(tmp_path, fully_paired: bool, modality_
         batch_key="batch",
         batch_size=4,
         shuffle=False,
+        parallel=False,
         categorical_covariate_keys=["site"],
         continuous_covariate_keys=["score"],
     )
@@ -214,6 +225,7 @@ def test_multivi_custom_dataloader_single_modality(
         batch_key="batch",
         batch_size=4,
         shuffle=False,
+        parallel=False,
         categorical_covariate_keys=["site"],
         continuous_covariate_keys=["score"],
     )
@@ -262,13 +274,16 @@ def test_multivi_custom_dataloader_requires_collection():
 @pytest.mark.dataloader
 @dependencies("lamindb")
 def test_multivi_custom_dataloader_no_extra_cat_covs_uses_batch_and_trains(tmp_path):
-    rna_collection, atac_collection, _, _, _ = _make_multivi_collections(tmp_path, fully_paired=True)
+    rna_collection, atac_collection, _, _, _ = _make_multivi_collections(
+        tmp_path, fully_paired=True
+    )
     datamodule = MultiVIMappedCollectionDataModule(
         rna_collection=rna_collection,
         atac_collection=atac_collection,
         batch_key="batch",
         batch_size=4,
         shuffle=False,
+        parallel=False,
         categorical_covariate_keys=None,
     )
 
@@ -281,3 +296,89 @@ def test_multivi_custom_dataloader_no_extra_cat_covs_uses_batch_and_trains(tmp_p
         dataloader=datamodule.inference_dataloader(batch_size=4)
     )
     assert latent.shape == (datamodule.n_obs, 5)
+
+
+@pytest.mark.dataloader
+@pytest.mark.parametrize(
+    ("rna_collection_name", "atac_collection_name", "expected_x_shape", "expected_atac_shape"),
+    [
+        ("rna_collection", "atac_collection", (4, 12), (4, 8)),
+        ("rna_collection", None, (4, 12), (4, 0)),
+        (None, "atac_collection", (4, 0), (4, 8)),
+    ],
+)
+@dependencies("lamindb")
+def test_multivi_custom_dataloader_parallel_workers_use_lazy_handles(
+    tmp_path,
+    rna_collection_name,
+    atac_collection_name,
+    expected_x_shape,
+    expected_atac_shape,
+):
+    rna_collection, atac_collection, _, _, _ = _make_multivi_collections(
+        tmp_path, fully_paired=False
+    )
+    collections = {
+        "rna_collection": rna_collection,
+        "atac_collection": atac_collection,
+        None: None,
+    }
+    datamodule = MultiVIMappedCollectionDataModule(
+        rna_collection=collections[rna_collection_name],
+        atac_collection=collections[atac_collection_name],
+        batch_key="batch",
+        batch_size=4,
+        shuffle=False,
+        parallel=True,
+        parallel_cpu_count=1,
+        categorical_covariate_keys=["site"],
+        continuous_covariate_keys=["score"],
+    )
+
+    dataloader = datamodule.inference_dataloader(batch_size=4)
+    assert dataloader.num_workers == 1
+    assert dataloader.persistent_workers is True
+    for source in datamodule._sources:
+        assert all(adata is None for adata in source._adatas)
+
+    batch = next(iter(dataloader))
+    assert batch[REGISTRY_KEYS.X_KEY].shape == expected_x_shape
+    assert batch[REGISTRY_KEYS.ATAC_X_KEY].shape == expected_atac_shape
+    for source in datamodule._sources:
+        assert all(adata is None for adata in source._adatas)
+
+    _shutdown_workers(dataloader)
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_multivi_custom_dataloader_parallel_false_keeps_single_process_fetching(tmp_path):
+    rna_collection, atac_collection, _, _, _ = _make_multivi_collections(
+        tmp_path, fully_paired=True
+    )
+    datamodule = MultiVIMappedCollectionDataModule(
+        rna_collection=rna_collection,
+        atac_collection=atac_collection,
+        batch_key="batch",
+        batch_size=4,
+        shuffle=False,
+        parallel=False,
+        categorical_covariate_keys=["site"],
+        continuous_covariate_keys=["score"],
+    )
+
+    dataloader = datamodule.inference_dataloader(batch_size=4)
+    assert dataloader.num_workers == 0
+    assert dataloader.persistent_workers is False
+    for source in datamodule._sources:
+        assert all(adata is None for adata in source._adatas)
+
+    batch = next(iter(dataloader))
+    assert batch[REGISTRY_KEYS.X_KEY].shape == (4, 12)
+    assert batch[REGISTRY_KEYS.ATAC_X_KEY].shape == (4, 8)
+    for source in datamodule._sources:
+        assert any(adata is not None for adata in source._adatas)
+
+    datamodule.close()
+    for source in datamodule._sources:
+        assert all(adata is None for adata in source._adatas)
