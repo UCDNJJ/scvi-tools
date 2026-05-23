@@ -947,8 +947,7 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
             )
             return DataLoader(
                 dataset,
-                batch_size=None,
-                sampler=sampler,
+                batch_sampler=sampler,
                 collate_fn=self._collate_fn,
             )
         return DataLoader(
