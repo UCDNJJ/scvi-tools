@@ -458,16 +458,19 @@ class _CollectionBackedAnnData:
     ):
         self._artifacts = list(collection.artifacts.all())
         self._obs_columns = list(dict.fromkeys(obs_columns))
-        self._adatas: list[AnnData] = []
+        self._adatas: list[AnnData | None] = [None] * len(self._artifacts)
+        self._adatas_pid: int | None = None
         self.obs_to_location: dict[str, tuple[int, int]] = {}
         self.obs_metadata: dict[str, dict[str, object]] = {}
         self.var_names: np.ndarray | None = None
 
         for artifact_idx, artifact in enumerate(self._artifacts):
             adata = self._open_artifact(artifact)
-            self._adatas.append(adata)
-            self._register_var_names(adata)
-            self._register_obs(artifact_idx, adata)
+            try:
+                self._register_var_names(adata)
+                self._register_obs(artifact_idx, adata)
+            finally:
+                self._close_adata(adata)
 
         if self.var_names is None:
             self.var_names = np.asarray([], dtype=object)
@@ -478,12 +481,9 @@ class _CollectionBackedAnnData:
 
     def close(self) -> None:
         for adata in self._adatas:
-            file_manager = getattr(adata, "file", None)
-            if file_manager is not None:
-                try:
-                    file_manager.close()
-                except (AttributeError, OSError, ValueError):
-                    pass
+            self._close_adata(adata)
+        self._adatas = [None] * len(self._artifacts)
+        self._adatas_pid = None
 
     def fetch_rows(self, obs_names: np.ndarray) -> np.ndarray:
         out = np.zeros((len(obs_names), self.n_vars), dtype=np.float32)
@@ -501,7 +501,7 @@ class _CollectionBackedAnnData:
             artifact_row_indices = np.asarray(row_indices[artifact_idx], dtype=np.int64)
             sort_order = np.argsort(artifact_row_indices)
             sorted_row_indices = artifact_row_indices[sort_order]
-            matrix = self._adatas[artifact_idx][sorted_row_indices].X
+            matrix = self._get_adata(artifact_idx)[sorted_row_indices].X
             if issparse(matrix):
                 matrix = matrix.toarray()
             else:
@@ -555,6 +555,28 @@ class _CollectionBackedAnnData:
                 for key, value in obs_frame.iloc[row_idx].to_dict().items()
             }
 
+    def _get_adata(self, artifact_idx: int) -> AnnData:
+        current_pid = os.getpid()
+        if self._adatas_pid != current_pid:
+            self.close()
+            self._adatas_pid = current_pid
+        adata = self._adatas[artifact_idx]
+        if adata is None:
+            adata = self._open_artifact(self._artifacts[artifact_idx])
+            self._adatas[artifact_idx] = adata
+        return adata
+
+    @staticmethod
+    def _close_adata(adata: AnnData | None) -> None:
+        if adata is None:
+            return
+        file_manager = getattr(adata, "file", None)
+        if file_manager is not None:
+            try:
+                file_manager.close()
+            except (AttributeError, OSError, ValueError):
+                pass
+
 
 class MultiVIMappedCollectionDataModule(LightningDataModule):
     """Data module for training :class:`~scvi.model.MULTIVI` from Lamin collections.
@@ -576,6 +598,11 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         Minibatch size.
     shuffle
         Whether to shuffle the training dataloader.
+    parallel
+        Whether to parallelize dataloader collation and row fetching with worker processes.
+    parallel_cpu_count
+        Number of dataloader workers to use when ``parallel=True``. Uses ``os.cpu_count() - 1``
+        when unset.
     categorical_covariate_keys
         Optional list of obs keys for categorical covariates.
     continuous_covariate_keys
@@ -612,6 +639,8 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         batch_key: str | None = None,
         batch_size: int = 128,
         shuffle: bool = True,
+        parallel: bool = True,
+        parallel_cpu_count: int | None = None,
         categorical_covariate_keys: list[str] | None = None,
         continuous_covariate_keys: list[str] | None = None,
     ):
@@ -624,6 +653,8 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         self._batch_size = batch_size
         self.shuffle = shuffle
         self.model_name = "MULTIVI"
+        self._parallel = parallel
+        self._parallel_cpu_count = parallel_cpu_count
         self._categorical_covariate_keys = categorical_covariate_keys
         self._continuous_covariate_keys = continuous_covariate_keys
         self._log_hyperparams = False
@@ -917,6 +948,12 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         shuffle: bool,
         batch_size: int | None = None,
     ) -> DataLoader:
+        num_workers = 0
+        if self._parallel:
+            if self._parallel_cpu_count is None:
+                num_workers = os.cpu_count() - 1
+            else:
+                num_workers = self._parallel_cpu_count
         if batch_size is None:
             batch_size = self._batch_size
         return DataLoader(
@@ -924,6 +961,8 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
             batch_size=batch_size,
             shuffle=shuffle,
             collate_fn=self._collate_fn,
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0,
         )
 
     @staticmethod
