@@ -9,6 +9,7 @@ import scvi
 from scvi import REGISTRY_KEYS
 from scvi.data import synthetic_iid
 from scvi.dataloaders import MultiVIMappedCollectionDataModule
+from scvi.dataloaders import _custom_dataloaders as custom_dataloaders
 from scvi.utils import dependencies
 
 
@@ -281,3 +282,46 @@ def test_multivi_custom_dataloader_no_extra_cat_covs_uses_batch_and_trains(tmp_p
         dataloader=datamodule.inference_dataloader(batch_size=4)
     )
     assert latent.shape == (datamodule.n_obs, 5)
+
+
+def test_multivi_custom_dataloader_ddp_uses_batch_sampler(monkeypatch):
+    class _TrackingIndexDataset(custom_dataloaders._IndexDataset):
+        def __init__(self, indices):
+            super().__init__(indices)
+            self.seen_index_types = []
+
+        def __getitem__(self, index: int) -> int:
+            self.seen_index_types.append(type(index))
+            return super().__getitem__(index)
+
+    class _DummyBatchDistributedSampler:
+        def __init__(self, dataset, batch_size, **kwargs):
+            self.dataset = dataset
+            self.batch_size = batch_size
+
+        def __iter__(self):
+            yield [0, 1]
+
+        def __len__(self):
+            return 1
+
+    monkeypatch.setattr(custom_dataloaders.dist, "is_available", lambda: True)
+    monkeypatch.setattr(custom_dataloaders.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        custom_dataloaders,
+        "BatchDistributedSampler",
+        _DummyBatchDistributedSampler,
+    )
+
+    datamodule = MultiVIMappedCollectionDataModule.__new__(MultiVIMappedCollectionDataModule)
+    datamodule._batch_size = 2
+    datamodule._drop_last = False
+    datamodule._drop_dataset_tail = False
+    datamodule._collate_fn = lambda batch_indices: batch_indices
+
+    dataset = _TrackingIndexDataset(np.arange(2, dtype=np.int64))
+    dataloader = datamodule._create_dataloader(dataset, shuffle=False)
+
+    assert isinstance(dataloader.batch_sampler, _DummyBatchDistributedSampler)
+    assert next(iter(dataloader)) == [0, 1]
+    assert dataset.seen_index_types == [int, int]
