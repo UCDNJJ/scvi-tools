@@ -653,6 +653,8 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         self._batch_size = batch_size
         self.shuffle = shuffle
         self.model_name = "MULTIVI"
+        if parallel_cpu_count is not None and parallel_cpu_count < 0:
+            raise ValueError("`parallel_cpu_count` must be non-negative.")
         self._parallel = parallel
         self._parallel_cpu_count = parallel_cpu_count
         self._categorical_covariate_keys = categorical_covariate_keys
@@ -951,7 +953,7 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         num_workers = 0
         if self._parallel:
             if self._parallel_cpu_count is None:
-                num_workers = os.cpu_count() - 1
+                num_workers = max((os.cpu_count() or 1) - 1, 0)
             else:
                 num_workers = self._parallel_cpu_count
         if batch_size is None:

@@ -38,7 +38,9 @@ class _FakeCollection:
 def _shutdown_workers(dataloader) -> None:
     iterator = getattr(dataloader, "_iterator", None)
     if iterator is not None:
-        iterator._shutdown_workers()
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            shutdown()
         dataloader._iterator = None
 
 
