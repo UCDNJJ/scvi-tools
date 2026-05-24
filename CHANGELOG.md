@@ -10,6 +10,9 @@ to [Semantic Versioning]. The full commit history is available in the [commit lo
 #### Added
 
 - Add support for rapids-singlecell, {pr}`3811`.
+- Add `num_workers`, `pin_memory`, `persistent_workers`, and `prefetch_factor` parameters to
+    {class}`scvi.dataloaders.MultiVIMappedCollectionDataModule` to enable multi-worker DataLoader
+    loading, significantly speeding up training.
 
 #### Fixed
 
