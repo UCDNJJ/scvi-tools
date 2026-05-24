@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 from anndata import AnnData
@@ -48,11 +49,27 @@ def _shutdown_workers(dataloader) -> None:
         dataloader._iterator = None
 
 
+def _prepare_h5ad_for_write(adata):
+    adata = adata.copy()
+    adata.obs_names = pd.Index(np.asarray(adata.obs_names.astype(str), dtype=object), dtype=object)
+    adata.var_names = pd.Index(np.asarray(adata.var_names.astype(str), dtype=object), dtype=object)
+    for column in adata.obs.columns:
+        if is_string_dtype(adata.obs[column]) or isinstance(
+            adata.obs[column].dtype, pd.CategoricalDtype
+        ):
+            adata.obs[column] = pd.Series(
+                np.asarray(adata.obs[column].astype(str), dtype=object),
+                index=adata.obs.index,
+                dtype=object,
+            )
+    return adata
+
+
 def _write_collection_parts(tmp_path, prefix: str, adatas):
     paths = []
     for idx, adata in enumerate(adatas):
         path = tmp_path / f"{prefix}_{idx}.h5ad"
-        adata.write_h5ad(path)
+        _prepare_h5ad_for_write(adata).write_h5ad(path)
         paths.append(str(path))
     return _FakeCollection(paths)
 
@@ -145,6 +162,60 @@ def _create_and_train_multivi_model(datamodule, modality_weights: str = "equal")
         adversarial_mixing=True,
     )
     return model
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_multivi_custom_dataloader_scans_local_h5ad_metadata_without_backed_read(
+    tmp_path, monkeypatch
+):
+    (
+        rna_collection,
+        atac_collection,
+        obs_names,
+        _,
+        _,
+    ) = _make_multivi_collections(tmp_path, fully_paired=True)
+    expected_var_names = np.asarray(
+        rna_collection.artifacts.all()[0].load().var_names,
+        dtype=object,
+    )
+    expected_region_names = np.asarray(
+        atac_collection.artifacts.all()[0].load().var_names,
+        dtype=object,
+    )
+
+    read_h5ad_calls = []
+    original_read_h5ad = custom_dataloaders.ad.read_h5ad
+
+    def _tracking_read_h5ad(*args, **kwargs):
+        read_h5ad_calls.append(kwargs.get("backed"))
+        return original_read_h5ad(*args, **kwargs)
+
+    monkeypatch.setattr(custom_dataloaders.ad, "read_h5ad", _tracking_read_h5ad)
+
+    datamodule = MultiVIMappedCollectionDataModule(
+        rna_collection=rna_collection,
+        atac_collection=atac_collection,
+        batch_key="batch",
+        batch_size=len(obs_names),
+        shuffle=False,
+        categorical_covariate_keys=["site"],
+        continuous_covariate_keys=["score"],
+    )
+
+    assert datamodule.n_obs == len(obs_names)
+    assert np.array_equal(datamodule.var_names, expected_var_names)
+    assert np.array_equal(datamodule.region_names, expected_region_names)
+    assert read_h5ad_calls == []
+
+    batch = next(iter(datamodule.inference_dataloader(batch_size=len(obs_names))))
+    assert batch[REGISTRY_KEYS.X_KEY].shape == (len(obs_names), len(expected_var_names))
+    assert batch[REGISTRY_KEYS.ATAC_X_KEY].shape == (
+        len(obs_names),
+        len(expected_region_names),
+    )
+    assert any(call == "r" for call in read_h5ad_calls)
 
 
 @pytest.mark.dataloader
@@ -319,11 +390,37 @@ def test_multivi_custom_dataloader_no_extra_cat_covs_uses_batch_and_trains(tmp_p
     model = _create_and_train_multivi_model(datamodule)
     assert model.is_trained
     assert model.module.n_batch == 2
-    assert model.module.n_cats_per_cov == []
+    assert list(model.module.n_cats_per_cov) == []
     latent = model.get_latent_representation(
         dataloader=datamodule.inference_dataloader(batch_size=4)
     )
     assert latent.shape == (datamodule.n_obs, 5)
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_multivi_custom_dataloader_propagates_worker_kwargs(tmp_path):
+    rna_collection, atac_collection, _, _, _ = _make_multivi_collections(
+        tmp_path, fully_paired=True
+    )
+    datamodule = MultiVIMappedCollectionDataModule(
+        rna_collection=rna_collection,
+        atac_collection=atac_collection,
+        batch_key="batch",
+        batch_size=4,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=3,
+    )
+
+    dataloader = datamodule.train_dataloader()
+    assert dataloader.num_workers == 2
+    assert dataloader.pin_memory is True
+    assert dataloader.persistent_workers is True
+    assert dataloader.prefetch_factor == 3
+    _shutdown_workers(dataloader)
 
 
 def test_multivi_custom_dataloader_ddp_uses_batch_sampler(monkeypatch):
@@ -359,12 +456,20 @@ def test_multivi_custom_dataloader_ddp_uses_batch_sampler(monkeypatch):
     datamodule._batch_size = 2
     datamodule._drop_last = False
     datamodule._drop_dataset_tail = False
+    datamodule._num_workers = 2
+    datamodule._pin_memory = True
+    datamodule._persistent_workers = True
+    datamodule._prefetch_factor = 4
     datamodule._collate_fn = lambda batch_indices: batch_indices
 
     dataset = _TrackingIndexDataset(np.arange(2, dtype=np.int64))
     dataloader = datamodule._create_dataloader(dataset, shuffle=False)
 
     assert isinstance(dataloader.batch_sampler, _DummyBatchDistributedSampler)
+    assert dataloader.num_workers == 2
+    assert dataloader.pin_memory is True
+    assert dataloader.persistent_workers is True
+    assert dataloader.prefetch_factor == 4
     sampled_batch = next(iter(dataloader.batch_sampler))
     assert sampled_batch == [0, 1]
     _ = [dataset[idx] for idx in sampled_batch]
@@ -377,6 +482,7 @@ def test_multivi_custom_dataloader_non_ddp_uses_main_process_loader(monkeypatch)
 
     datamodule = MultiVIMappedCollectionDataModule.__new__(MultiVIMappedCollectionDataModule)
     datamodule._batch_size = 2
+    datamodule._persistent_workers = True
     datamodule._collate_fn = lambda batch_indices: batch_indices
 
     dataset = custom_dataloaders._IndexDataset(np.arange(4, dtype=np.int64))
