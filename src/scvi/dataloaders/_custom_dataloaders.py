@@ -729,6 +729,19 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
     drop_last
         When running under DDP, whether to drop the last incomplete batch per replica.
         Passed to :class:`~scvi.dataloaders.BatchDistributedSampler`.
+    num_workers
+        Number of worker processes for the :class:`~torch.utils.data.DataLoader`. Setting
+        ``num_workers > 0`` can significantly speed up training by overlapping data loading
+        with model computation. Default is ``0`` (single-process loading).
+    pin_memory
+        If ``True``, the data loader will copy tensors into CUDA pinned memory before
+        returning them. Only effective when using a GPU. Default is ``False``.
+    persistent_workers
+        If ``True``, worker processes will not be shut down between epochs. Forced to
+        ``False`` when ``num_workers == 0``. Default is ``False``.
+    prefetch_factor
+        Number of batches loaded in advance by each worker. Only passed to the
+        :class:`~torch.utils.data.DataLoader` when ``num_workers > 0``. Default is ``None``.
 
     Notes
     -----
@@ -772,6 +785,10 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         sparse_rna: bool = False,
         drop_dataset_tail: bool = False,
         drop_last: bool = False,
+        num_workers: int = 0,
+        pin_memory: bool = False,
+        persistent_workers: bool = False,
+        prefetch_factor: int | None = None,
     ):
         super().__init__()
         if rna_collection is None and atac_collection is None:
@@ -788,6 +805,10 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         self._continuous_covariate_keys = continuous_covariate_keys
         self._sparse_atac = sparse_atac
         self._sparse_rna = sparse_rna
+        self._num_workers = num_workers
+        self._pin_memory = pin_memory
+        self._persistent_workers = persistent_workers
+        self._prefetch_factor = prefetch_factor
         self._log_hyperparams = False
         self.allow_zero_length_dataloader_with_multiple_devices = False
 
