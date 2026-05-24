@@ -14,6 +14,8 @@ to [Semantic Versioning]. The full commit history is available in the [commit lo
 #### Fixed
 
 - Fix list of metrics to be recorded in {class}`scvi.autotune.AutotuneExperiment`, {pr}`3816`.
+- Speed up {class}`scvi.dataloaders.MultiVIMappedCollectionDataModule` initialization for
+  local `.h5ad` artifacts and add configurable DataLoader worker settings.
 
 #### Changed
 
