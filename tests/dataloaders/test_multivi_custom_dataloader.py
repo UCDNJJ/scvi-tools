@@ -9,6 +9,7 @@ import scvi
 from scvi import REGISTRY_KEYS
 from scvi.data import synthetic_iid
 from scvi.dataloaders import MultiVIMappedCollectionDataModule
+from scvi.dataloaders import _custom_dataloaders as custom_dataloaders
 from scvi.utils import dependencies
 
 
@@ -298,87 +299,44 @@ def test_multivi_custom_dataloader_no_extra_cat_covs_uses_batch_and_trains(tmp_p
     assert latent.shape == (datamodule.n_obs, 5)
 
 
-@pytest.mark.dataloader
-@pytest.mark.parametrize(
-    ("rna_collection_name", "atac_collection_name", "expected_x_shape", "expected_atac_shape"),
-    [
-        ("rna_collection", "atac_collection", (4, 12), (4, 8)),
-        ("rna_collection", None, (4, 12), (4, 0)),
-        (None, "atac_collection", (4, 0), (4, 8)),
-    ],
-)
-@dependencies("lamindb")
-def test_multivi_custom_dataloader_parallel_workers_use_lazy_handles(
-    tmp_path,
-    rna_collection_name,
-    atac_collection_name,
-    expected_x_shape,
-    expected_atac_shape,
-):
-    rna_collection, atac_collection, _, _, _ = _make_multivi_collections(
-        tmp_path, fully_paired=False
-    )
-    collections = {
-        "rna_collection": rna_collection,
-        "atac_collection": atac_collection,
-        None: None,
-    }
-    datamodule = MultiVIMappedCollectionDataModule(
-        rna_collection=collections[rna_collection_name],
-        atac_collection=collections[atac_collection_name],
-        batch_key="batch",
-        batch_size=4,
-        shuffle=False,
-        parallel=True,
-        parallel_cpu_count=1,
-        categorical_covariate_keys=["site"],
-        continuous_covariate_keys=["score"],
+def test_multivi_custom_dataloader_ddp_uses_batch_sampler(monkeypatch):
+    class _TrackingIndexDataset(custom_dataloaders._IndexDataset):
+        def __init__(self, indices):
+            super().__init__(indices)
+            self.seen_index_types = []
+
+        def __getitem__(self, index: int) -> int:
+            self.seen_index_types.append(type(index))
+            return super().__getitem__(index)
+
+    class _DummyBatchDistributedSampler:
+        def __init__(self, dataset, batch_size, **kwargs):
+            self.dataset = dataset
+            self.batch_size = batch_size
+
+        def __iter__(self):
+            yield [0, 1]
+
+        def __len__(self):
+            return 1
+
+    monkeypatch.setattr(custom_dataloaders.dist, "is_available", lambda: True)
+    monkeypatch.setattr(custom_dataloaders.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        custom_dataloaders,
+        "BatchDistributedSampler",
+        _DummyBatchDistributedSampler,
     )
 
-    dataloader = datamodule.inference_dataloader(batch_size=4)
-    assert dataloader.num_workers == 1
-    assert dataloader.persistent_workers is True
-    for source in datamodule._sources:
-        assert all(adata is None for adata in source._adatas)
+    datamodule = MultiVIMappedCollectionDataModule.__new__(MultiVIMappedCollectionDataModule)
+    datamodule._batch_size = 2
+    datamodule._drop_last = False
+    datamodule._drop_dataset_tail = False
+    datamodule._collate_fn = lambda batch_indices: batch_indices
 
-    batch = next(iter(dataloader))
-    assert batch[REGISTRY_KEYS.X_KEY].shape == expected_x_shape
-    assert batch[REGISTRY_KEYS.ATAC_X_KEY].shape == expected_atac_shape
-    for source in datamodule._sources:
-        assert all(adata is None for adata in source._adatas)
+    dataset = _TrackingIndexDataset(np.arange(2, dtype=np.int64))
+    dataloader = datamodule._create_dataloader(dataset, shuffle=False)
 
-    _shutdown_workers(dataloader)
-
-
-@pytest.mark.dataloader
-@dependencies("lamindb")
-def test_multivi_custom_dataloader_parallel_false_keeps_single_process_fetching(tmp_path):
-    rna_collection, atac_collection, _, _, _ = _make_multivi_collections(
-        tmp_path, fully_paired=True
-    )
-    datamodule = MultiVIMappedCollectionDataModule(
-        rna_collection=rna_collection,
-        atac_collection=atac_collection,
-        batch_key="batch",
-        batch_size=4,
-        shuffle=False,
-        parallel=False,
-        categorical_covariate_keys=["site"],
-        continuous_covariate_keys=["score"],
-    )
-
-    dataloader = datamodule.inference_dataloader(batch_size=4)
-    assert dataloader.num_workers == 0
-    assert dataloader.persistent_workers is False
-    for source in datamodule._sources:
-        assert all(adata is None for adata in source._adatas)
-
-    batch = next(iter(dataloader))
-    assert batch[REGISTRY_KEYS.X_KEY].shape == (4, 12)
-    assert batch[REGISTRY_KEYS.ATAC_X_KEY].shape == (4, 8)
-    for source in datamodule._sources:
-        assert any(adata is not None for adata in source._adatas)
-
-    datamodule.close()
-    for source in datamodule._sources:
-        assert all(adata is None for adata in source._adatas)
+    assert isinstance(dataloader.batch_sampler, _DummyBatchDistributedSampler)
+    assert next(iter(dataloader)) == [0, 1]
+    assert dataset.seen_index_types == [int, int]

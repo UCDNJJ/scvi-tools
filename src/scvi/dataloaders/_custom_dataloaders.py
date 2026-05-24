@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import anndata as ad
 import numpy as np
 import torch
+import torch.distributed as dist
 from lightning.pytorch import LightningDataModule
 from scipy.sparse import issparse
 from sklearn.preprocessing import LabelEncoder
@@ -14,6 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 
 import scvi
 from scvi import REGISTRY_KEYS
+from scvi.dataloaders._samplers import BatchDistributedSampler
 from scvi.model._utils import parse_device_args
 from scvi.utils import dependencies
 
@@ -607,10 +609,22 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         Optional list of obs keys for categorical covariates.
     continuous_covariate_keys
         Optional list of obs keys for continuous covariates.
+    drop_dataset_tail
+        When running under DDP, whether to drop the tail of the dataset to make it
+        evenly divisible by the number of replicas. Passed to
+        :class:`~scvi.dataloaders.BatchDistributedSampler`.
+    drop_last
+        When running under DDP, whether to drop the last incomplete batch per replica.
+        Passed to :class:`~scvi.dataloaders.BatchDistributedSampler`.
 
     Notes
     -----
     At least one of ``rna_collection`` or ``atac_collection`` must be provided.
+
+    When PyTorch Distributed Data Parallel (DDP) is active (i.e.
+    :func:`torch.distributed.is_initialized` returns ``True``),
+    :class:`~scvi.dataloaders.BatchDistributedSampler` is used automatically so that
+    each rank sees a non-overlapping subset of the data.
 
     Examples
     --------
@@ -643,6 +657,8 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         parallel_cpu_count: int | None = None,
         categorical_covariate_keys: list[str] | None = None,
         continuous_covariate_keys: list[str] | None = None,
+        drop_dataset_tail: bool = False,
+        drop_last: bool = False,
     ):
         super().__init__()
         if rna_collection is None and atac_collection is None:
@@ -652,6 +668,8 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         self._batch_key = batch_key
         self._batch_size = batch_size
         self.shuffle = shuffle
+        self._drop_dataset_tail = drop_dataset_tail
+        self._drop_last = drop_last
         self.model_name = "MULTIVI"
         if parallel_cpu_count is not None and parallel_cpu_count < 0:
             raise ValueError("`parallel_cpu_count` must be non-negative.")
@@ -958,6 +976,19 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
                 num_workers = self._parallel_cpu_count
         if batch_size is None:
             batch_size = self._batch_size
+        if dist.is_available() and dist.is_initialized():
+            sampler = BatchDistributedSampler(
+                dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                drop_last=self._drop_last,
+                drop_dataset_tail=self._drop_dataset_tail,
+            )
+            return DataLoader(
+                dataset,
+                batch_sampler=sampler,
+                collate_fn=self._collate_fn,
+            )
         return DataLoader(
             dataset,
             batch_size=batch_size,

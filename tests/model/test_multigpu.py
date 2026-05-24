@@ -1,12 +1,16 @@
 import os
 import subprocess
+from dataclasses import dataclass
 
+import numpy as np
 import pytest
 import torch
 from mudata import MuData
 
 import scvi
+from scvi.data import synthetic_iid
 from scvi.model import MULTIVI, PEAKVI, TOTALVI, CondSCVI, LinearSCVI
+from scvi.utils import dependencies
 
 
 @pytest.mark.multigpu
@@ -336,3 +340,92 @@ assert model.is_trained
             os.remove(temp_file_path)
 
     launch_ddp(torch.cuda.device_count(), temp_file_path)
+
+
+@dataclass
+class _FakeArtifact:
+    path: str
+
+    def load(self):
+        from anndata import read_h5ad
+
+        return read_h5ad(self.path)
+
+
+class _FakeArtifacts:
+    def __init__(self, artifacts):
+        self._artifacts = artifacts
+
+    def all(self):
+        return self._artifacts
+
+
+class _FakeCollection:
+    def __init__(self, paths: list[str]):
+        self.artifacts = _FakeArtifacts([_FakeArtifact(path) for path in paths])
+
+
+def _write_collection_parts(tmp_path, prefix: str, adatas):
+    paths = []
+    for idx, adata in enumerate(adatas):
+        path = tmp_path / f"{prefix}_{idx}.h5ad"
+        adata.write_h5ad(path)
+        paths.append(str(path))
+    return _FakeCollection(paths)
+
+
+def _make_multivi_collections_for_multigpu(tmp_path):
+    mdata = synthetic_iid(
+        batch_size=8,
+        n_batches=2,
+        n_genes=12,
+        n_regions=8,
+        n_proteins=4,
+        return_mudata=True,
+    )
+    rna = mdata.mod["rna"].copy()
+    atac = mdata.mod["accessibility"].copy()
+    for adata in (rna, atac):
+        adata.obs["batch"] = np.where(
+            np.arange(adata.n_obs) < adata.n_obs // 2,
+            "batch_0",
+            "batch_1",
+        )
+    rna_parts = [rna[: rna.n_obs // 2].copy(), rna[rna.n_obs // 2 :].copy()]
+    atac_parts = [atac[: atac.n_obs // 2].copy(), atac[atac.n_obs // 2 :].copy()]
+    rna_collection = _write_collection_parts(tmp_path, "rna", rna_parts)
+    atac_collection = _write_collection_parts(tmp_path, "atac", atac_parts)
+    return rna_collection, atac_collection
+
+
+@pytest.mark.multigpu
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_multivi_mapped_collection_multigpu(tmp_path):
+    from scvi.dataloaders import MultiVIMappedCollectionDataModule
+
+    rna_collection, atac_collection = _make_multivi_collections_for_multigpu(tmp_path)
+    datamodule = MultiVIMappedCollectionDataModule(
+        rna_collection=rna_collection,
+        atac_collection=atac_collection,
+        batch_key="batch",
+        batch_size=4,
+        shuffle=True,
+        drop_dataset_tail=True,
+        drop_last=False,
+    )
+    model = MULTIVI(
+        adata=None,
+        registry=datamodule.registry,
+        n_latent=5,
+        n_hidden=16,
+        modality_weights="equal",
+    )
+    model.train(
+        datamodule=datamodule,
+        max_epochs=1,
+        accelerator="gpu",
+        devices=-1,
+        strategy="ddp_find_unused_parameters_true",
+    )
+    assert model.is_trained
