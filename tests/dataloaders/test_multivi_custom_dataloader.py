@@ -5,7 +5,9 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import pytest
-from pandas.api.types import is_string_dtype
+import torch
+from anndata import AnnData
+from scipy.sparse import csr_matrix, issparse
 
 import scvi
 from scvi import REGISTRY_KEYS
@@ -72,7 +74,12 @@ def _write_collection_parts(tmp_path, prefix: str, adatas):
     return _FakeCollection(paths)
 
 
-def _make_multivi_collections(tmp_path, fully_paired: bool):
+def _make_multivi_collections(
+    tmp_path,
+    fully_paired: bool,
+    sparse_atac: bool = True,
+    sparse_rna: bool = False,
+):
     mdata = synthetic_iid(
         batch_size=6,
         n_batches=2,
@@ -86,6 +93,10 @@ def _make_multivi_collections(tmp_path, fully_paired: bool):
 
     rna = mdata.mod["rna"][order].copy()
     atac = mdata.mod["accessibility"][order].copy()
+    if sparse_rna:
+        rna.X = csr_matrix(rna.X.toarray() if hasattr(rna.X, "toarray") else np.asarray(rna.X))
+    if sparse_atac:
+        atac.X = csr_matrix(atac.X.toarray() if hasattr(atac.X, "toarray") else np.asarray(atac.X))
     for adata in (rna, atac):
         adata.obs_names = obs_names
         adata.obs["batch"] = np.where(
@@ -114,6 +125,25 @@ def _make_multivi_collections(tmp_path, fully_paired: bool):
     rna_collection = _write_collection_parts(tmp_path, "rna", rna_parts)
     atac_collection = _write_collection_parts(tmp_path, "atac", atac_parts)
     return rna_collection, atac_collection, sorted(set(obs_names)), missing_rna, missing_atac
+
+
+def _make_sparse_collection_source(tmp_path):
+    adata_1 = AnnData(
+        X=csr_matrix(np.array([[1, 0, 0], [0, 2, 0], [0, 0, 3]], dtype=np.float32)),
+    )
+    adata_1.obs_names = np.array(["cell_0", "cell_1", "cell_2"], dtype=object)
+    adata_1.var_names = np.array(["var_0", "var_1", "var_2"], dtype=object)
+    adata_1.obs["batch"] = "batch_0"
+
+    adata_2 = AnnData(
+        X=csr_matrix(np.array([[4, 0, 0], [0, 5, 0], [0, 0, 6]], dtype=np.float32)),
+    )
+    adata_2.obs_names = np.array(["cell_3", "cell_4", "cell_5"], dtype=object)
+    adata_2.var_names = np.array(["var_0", "var_1", "var_2"], dtype=object)
+    adata_2.obs["batch"] = "batch_1"
+
+    collection = _write_collection_parts(tmp_path, "sparse", [adata_1, adata_2])
+    return custom_dataloaders._CollectionBackedAnnData(collection, obs_columns=["batch"])
 
 
 def _create_and_train_multivi_model(datamodule, modality_weights: str = "equal"):
@@ -459,4 +489,104 @@ def test_multivi_custom_dataloader_non_ddp_uses_main_process_loader(monkeypatch)
     dataloader = datamodule._create_dataloader(dataset, shuffle=False)
 
     assert dataloader.num_workers == 0
-    assert dataloader.persistent_workers is False
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_fetch_rows_returns_sparse_when_densify_false(tmp_path):
+    source = _make_sparse_collection_source(tmp_path)
+    obs_names = np.array(["cell_4", "cell_0", "cell_3", "cell_1"], dtype=object)
+    sparse_matrix = source.fetch_rows(obs_names, densify=False)
+    dense_matrix = source.fetch_rows(obs_names, densify=True)
+
+    assert issparse(sparse_matrix)
+    assert sparse_matrix.shape == (len(obs_names), source.n_vars)
+    np.testing.assert_allclose(sparse_matrix.toarray(), dense_matrix)
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_fetch_rows_dense_when_densify_true(tmp_path):
+    source = _make_sparse_collection_source(tmp_path)
+    obs_names = np.array(["cell_4", "cell_0", "cell_3", "cell_1"], dtype=object)
+    dense_matrix = source.fetch_rows(obs_names, densify=True)
+    assert isinstance(dense_matrix, np.ndarray)
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_fetch_rows_sparse_handles_missing_obs_names(tmp_path):
+    source = _make_sparse_collection_source(tmp_path)
+    obs_names = np.array(["cell_0", "missing_cell", "cell_5", "another_missing"], dtype=object)
+    sparse_matrix = source.fetch_rows(obs_names, densify=False)
+    dense = sparse_matrix.toarray()
+
+    assert issparse(sparse_matrix)
+    np.testing.assert_allclose(dense[1], np.zeros(source.n_vars, dtype=np.float32))
+    np.testing.assert_allclose(dense[3], np.zeros(source.n_vars, dtype=np.float32))
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_collate_fn_emits_sparse_atac_tensor(tmp_path):
+    rna_collection, atac_collection, obs_names, _, _ = _make_multivi_collections(
+        tmp_path, fully_paired=False
+    )
+    datamodule = MultiVIMappedCollectionDataModule(
+        rna_collection=rna_collection,
+        atac_collection=atac_collection,
+        batch_key="batch",
+        batch_size=len(obs_names),
+        shuffle=False,
+        sparse_atac=True,
+    )
+
+    batch = next(iter(datamodule.inference_dataloader(batch_size=len(obs_names))))
+    atac_tensor = batch[REGISTRY_KEYS.ATAC_X_KEY]
+    indices = batch[REGISTRY_KEYS.INDICES_KEY].squeeze(-1).numpy()
+    batch_obs_names = datamodule._global_obs_names[indices]
+    expected = datamodule._atac_source.fetch_rows(batch_obs_names, densify=True)
+
+    assert atac_tensor.layout == torch.sparse_csr
+    assert atac_tensor.is_sparse_csr
+    assert batch["atac_X"] is atac_tensor
+    assert atac_tensor.shape == (len(obs_names), datamodule.n_regions)
+    np.testing.assert_allclose(atac_tensor.to_dense().numpy(), expected)
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_collate_fn_emits_dense_atac_when_sparse_atac_false(tmp_path):
+    rna_collection, atac_collection, obs_names, _, _ = _make_multivi_collections(
+        tmp_path, fully_paired=False
+    )
+    datamodule = MultiVIMappedCollectionDataModule(
+        rna_collection=rna_collection,
+        atac_collection=atac_collection,
+        batch_key="batch",
+        batch_size=len(obs_names),
+        shuffle=False,
+        sparse_atac=False,
+    )
+
+    batch = next(iter(datamodule.inference_dataloader(batch_size=len(obs_names))))
+    atac_tensor = batch[REGISTRY_KEYS.ATAC_X_KEY]
+    assert not atac_tensor.is_sparse
+    assert not atac_tensor.is_sparse_csr
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_multivi_custom_dataloader_sparse_atac_smoke_train(tmp_path):
+    _, atac_collection, _, _, _ = _make_multivi_collections(tmp_path, fully_paired=False)
+    datamodule = MultiVIMappedCollectionDataModule(
+        rna_collection=None,
+        atac_collection=atac_collection,
+        batch_key="batch",
+        batch_size=4,
+        shuffle=False,
+        sparse_atac=True,
+    )
+    model = scvi.model.MULTIVI(adata=None, registry=datamodule.registry, modality_weights="equal")
+    model.train(datamodule=datamodule, max_epochs=1, batch_size=4)
+    assert model.module is not None

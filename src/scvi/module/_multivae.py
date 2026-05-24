@@ -1,3 +1,4 @@
+import warnings
 from collections.abc import Iterable
 from typing import Literal
 
@@ -329,6 +330,7 @@ class MULTIVAE(BaseMinifiedModeModuleClass):
         self.n_continuous_cov = n_continuous_cov
         self.dropout_rate = dropout_rate
         self.extra_payload_autotune = extra_payload_autotune
+        self._sparse_input_warning_emitted = False
 
         self.use_batch_norm_encoder = use_batch_norm in ("encoder", "both")
         self.use_batch_norm_decoder = use_batch_norm in ("decoder", "both")
@@ -549,6 +551,26 @@ class MULTIVAE(BaseMinifiedModeModuleClass):
         """Get input tensors for the inference model."""
         x = tensors.get(REGISTRY_KEYS.X_KEY, None)
         x_atac = tensors.get(REGISTRY_KEYS.ATAC_X_KEY, None)
+        if x is not None and x.layout in (torch.sparse_coo, torch.sparse_csr):
+            if not self._sparse_input_warning_emitted:
+                warnings.warn(
+                    "MULTIVAE received sparse input and will densify it on-device during "
+                    "inference. Set sparse_atac=False if this causes memory pressure.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self._sparse_input_warning_emitted = True
+            x = x.to_dense()
+        if x_atac is not None and x_atac.layout in (torch.sparse_coo, torch.sparse_csr):
+            if not self._sparse_input_warning_emitted:
+                warnings.warn(
+                    "MULTIVAE received sparse input and will densify it on-device during "
+                    "inference. Set sparse_atac=False if this causes memory pressure.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self._sparse_input_warning_emitted = True
+            x_atac = x_atac.to_dense()
         if x is not None and x_atac is not None:
             x = torch.cat((x, x_atac), dim=-1)
         elif x is None:
