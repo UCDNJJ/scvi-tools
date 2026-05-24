@@ -600,11 +600,6 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         Minibatch size.
     shuffle
         Whether to shuffle the training dataloader.
-    parallel
-        Whether to parallelize dataloader collation and row fetching with worker processes.
-    parallel_cpu_count
-        Number of dataloader workers to use when ``parallel=True``. Uses ``os.cpu_count() - 1``
-        when unset.
     categorical_covariate_keys
         Optional list of obs keys for categorical covariates.
     continuous_covariate_keys
@@ -653,8 +648,6 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         batch_key: str | None = None,
         batch_size: int = 128,
         shuffle: bool = True,
-        parallel: bool = True,
-        parallel_cpu_count: int | None = None,
         categorical_covariate_keys: list[str] | None = None,
         continuous_covariate_keys: list[str] | None = None,
         drop_dataset_tail: bool = False,
@@ -671,10 +664,6 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         self._drop_dataset_tail = drop_dataset_tail
         self._drop_last = drop_last
         self.model_name = "MULTIVI"
-        if parallel_cpu_count is not None and parallel_cpu_count < 0:
-            raise ValueError("`parallel_cpu_count` must be non-negative.")
-        self._parallel = parallel
-        self._parallel_cpu_count = parallel_cpu_count
         self._categorical_covariate_keys = categorical_covariate_keys
         self._continuous_covariate_keys = continuous_covariate_keys
         self._log_hyperparams = False
@@ -968,12 +957,6 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         shuffle: bool,
         batch_size: int | None = None,
     ) -> DataLoader:
-        num_workers = 0
-        if self._parallel:
-            if self._parallel_cpu_count is None:
-                num_workers = max((os.cpu_count() or 1) - 1, 0)
-            else:
-                num_workers = self._parallel_cpu_count
         if batch_size is None:
             batch_size = self._batch_size
         if dist.is_available() and dist.is_initialized():
@@ -994,8 +977,6 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
             batch_size=batch_size,
             shuffle=shuffle,
             collate_fn=self._collate_fn,
-            num_workers=num_workers,
-            persistent_workers=num_workers > 0,
         )
 
     @staticmethod
