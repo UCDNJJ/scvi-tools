@@ -399,6 +399,7 @@ def _make_multivi_collections_for_multigpu(tmp_path):
 
 
 @pytest.mark.multigpu
+@pytest.mark.dataloader
 @dependencies("lamindb")
 def test_multivi_mapped_collection_multigpu(tmp_path):
     from scvi.dataloaders import MultiVIMappedCollectionDataModule

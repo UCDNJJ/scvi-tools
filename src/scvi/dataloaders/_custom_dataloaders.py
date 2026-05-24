@@ -628,7 +628,7 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         shuffle: bool = True,
         categorical_covariate_keys: list[str] | None = None,
         continuous_covariate_keys: list[str] | None = None,
-        drop_dataset_tail: bool = True,
+        drop_dataset_tail: bool = False,
         drop_last: bool = False,
     ):
         super().__init__()
