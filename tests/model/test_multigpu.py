@@ -3,7 +3,9 @@ import subprocess
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 import pytest
+from pandas.api.types import is_string_dtype
 import torch
 from mudata import MuData
 
@@ -369,6 +371,18 @@ def _write_collection_parts(tmp_path, prefix: str, adatas):
     paths = []
     for idx, adata in enumerate(adatas):
         path = tmp_path / f"{prefix}_{idx}.h5ad"
+        adata = adata.copy()
+        adata.obs_names = pd.Index(np.asarray(adata.obs_names.astype(str), dtype=object), dtype=object)
+        adata.var_names = pd.Index(np.asarray(adata.var_names.astype(str), dtype=object), dtype=object)
+        for column in adata.obs.columns:
+            if is_string_dtype(adata.obs[column]) or isinstance(
+                adata.obs[column].dtype, pd.CategoricalDtype
+            ):
+                adata.obs[column] = pd.Series(
+                    np.asarray(adata.obs[column].astype(str), dtype=object),
+                    index=adata.obs.index,
+                    dtype=object,
+                )
         adata.write_h5ad(path)
         paths.append(str(path))
     return _FakeCollection(paths)

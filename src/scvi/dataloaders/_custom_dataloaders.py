@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import TYPE_CHECKING
 
 import anndata as ad
+import h5py
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -26,6 +27,43 @@ if TYPE_CHECKING:
     import pandas as pd
     import tiledbsoma as soma
     from anndata import AnnData
+
+
+def _normalize_h5_index_key(index_key: object) -> str:
+    if isinstance(index_key, bytes):
+        return index_key.decode()
+    return str(index_key)
+
+
+def _maybe_python_scalar(value: object) -> object:
+    return value.item() if hasattr(value, "item") else value
+
+
+def _scan_h5ad_metadata(
+    path: str, obs_columns: list[str]
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    try:
+        from anndata.io import read_elem
+    except ImportError:  # pragma: no cover
+        from anndata.experimental import read_elem
+
+    with h5py.File(path, "r") as handle:
+        var_group = handle["var"]
+        var_index_key = _normalize_h5_index_key(var_group.attrs.get("_index", "_index"))
+        var_names = np.asarray(read_elem(var_group[var_index_key]), dtype=object)
+
+        obs_group = handle["obs"]
+        obs_index_key = _normalize_h5_index_key(obs_group.attrs.get("_index", "_index"))
+        obs_names = np.asarray(read_elem(obs_group[obs_index_key]), dtype=object).astype(str)
+
+        obs_data = {}
+        for column in obs_columns:
+            if column in obs_group:
+                obs_data[column] = np.asarray(read_elem(obs_group[column]))
+            else:
+                obs_data[column] = np.full(len(obs_names), None, dtype=object)
+
+    return var_names, obs_names, obs_data
 
 
 class MappedCollectionDataModule(LightningDataModule):
@@ -467,6 +505,13 @@ class _CollectionBackedAnnData:
         self.var_names: np.ndarray | None = None
 
         for artifact_idx, artifact in enumerate(self._artifacts):
+            path = self._get_artifact_path(artifact)
+            if path is not None and os.fspath(path).lower().endswith(".h5ad"):
+                var_names, obs_names, obs_data = _scan_h5ad_metadata(path, self._obs_columns)
+                self._set_var_names(var_names)
+                self._register_obs_from_arrays(artifact_idx, obs_names, obs_data)
+                continue
+
             adata = self._open_artifact(artifact)
             try:
                 self._register_var_names(adata)
@@ -538,7 +583,9 @@ class _CollectionBackedAnnData:
         return None
 
     def _register_var_names(self, adata: AnnData) -> None:
-        var_names = np.asarray(adata.var_names, dtype=object)
+        self._set_var_names(np.asarray(adata.var_names, dtype=object))
+
+    def _set_var_names(self, var_names: np.ndarray) -> None:
         if self.var_names is None:
             self.var_names = var_names
         elif not np.array_equal(self.var_names, var_names):
@@ -556,6 +603,41 @@ class _CollectionBackedAnnData:
                 key: value.item() if hasattr(value, "item") else value
                 for key, value in obs_frame.iloc[row_idx].to_dict().items()
             }
+
+    def _register_obs_from_arrays(
+        self,
+        artifact_idx: int,
+        obs_names: np.ndarray,
+        obs_data: dict[str, np.ndarray],
+    ) -> None:
+        seen_obs_names = set(self.obs_to_location)
+        for obs_name in obs_names:
+            if obs_name in seen_obs_names:
+                raise ValueError(f"Duplicate obs_name {obs_name!r} found in collection.")
+            seen_obs_names.add(obs_name)
+
+        self.obs_to_location.update(
+            {
+                obs_name: (artifact_idx, row_idx)
+                for row_idx, obs_name in enumerate(obs_names)
+            }
+        )
+        if not self._obs_columns:
+            self.obs_metadata.update({obs_name: {} for obs_name in obs_names})
+            return
+        self.obs_metadata.update(
+            {
+                obs_name: {
+                    key: _maybe_python_scalar(value)
+                    for key, value in zip(self._obs_columns, row_values, strict=True)
+                }
+                for obs_name, row_values in zip(
+                    obs_names,
+                    zip(*(obs_data[key] for key in self._obs_columns), strict=True),
+                    strict=True,
+                )
+            }
+        )
 
     def _get_adata(self, artifact_idx: int) -> AnnData:
         current_pid = os.getpid()
@@ -604,6 +686,19 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         Optional list of obs keys for categorical covariates.
     continuous_covariate_keys
         Optional list of obs keys for continuous covariates.
+    num_workers
+        Number of DataLoader worker processes. Defaults to 0 (single-process).
+        Setting >0 (e.g. 2-8) significantly speeds up training because the backed
+        h5ad reads happen in parallel with GPU compute. Worker processes are safe
+        here because `_get_adata` re-opens file handles per-pid.
+    pin_memory
+        Whether to pin DataLoader batches in memory before transfer.
+    persistent_workers
+        Whether to keep DataLoader workers alive across epochs. Only applies when
+        ``num_workers > 0``.
+    prefetch_factor
+        Number of batches loaded in advance by each worker. Only applies when
+        ``num_workers > 0``.
     drop_dataset_tail
         When running under DDP, whether to drop the tail of the dataset to make it
         evenly divisible by the number of replicas. Passed to
@@ -650,6 +745,10 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         shuffle: bool = True,
         categorical_covariate_keys: list[str] | None = None,
         continuous_covariate_keys: list[str] | None = None,
+        num_workers: int = 0,
+        pin_memory: bool = False,
+        persistent_workers: bool = False,
+        prefetch_factor: int | None = None,
         drop_dataset_tail: bool = False,
         drop_last: bool = False,
     ):
@@ -666,6 +765,10 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         self.model_name = "MULTIVI"
         self._categorical_covariate_keys = categorical_covariate_keys
         self._continuous_covariate_keys = continuous_covariate_keys
+        self._num_workers = num_workers
+        self._pin_memory = pin_memory
+        self._persistent_workers = persistent_workers
+        self._prefetch_factor = prefetch_factor
         self._log_hyperparams = False
         self.allow_zero_length_dataloader_with_multiple_devices = False
 
@@ -959,6 +1062,18 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
     ) -> DataLoader:
         if batch_size is None:
             batch_size = self._batch_size
+        num_workers = getattr(self, "_num_workers", 0)
+        dataloader_kwargs = {
+            "collate_fn": self._collate_fn,
+            "num_workers": num_workers,
+            "pin_memory": getattr(self, "_pin_memory", False),
+            "persistent_workers": (
+                getattr(self, "_persistent_workers", False) if num_workers > 0 else False
+            ),
+        }
+        prefetch_factor = getattr(self, "_prefetch_factor", None)
+        if num_workers > 0 and prefetch_factor is not None:
+            dataloader_kwargs["prefetch_factor"] = prefetch_factor
         if dist.is_available() and dist.is_initialized():
             sampler = BatchDistributedSampler(
                 dataset,
@@ -970,13 +1085,13 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
             return DataLoader(
                 dataset,
                 batch_sampler=sampler,
-                collate_fn=self._collate_fn,
+                **dataloader_kwargs,
             )
         return DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
-            collate_fn=self._collate_fn,
+            **dataloader_kwargs,
         )
 
     @staticmethod
