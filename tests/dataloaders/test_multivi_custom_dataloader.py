@@ -36,6 +36,15 @@ class _FakeCollection:
         self.artifacts = _FakeArtifacts([_FakeArtifact(path) for path in paths])
 
 
+def _shutdown_workers(dataloader) -> None:
+    iterator = getattr(dataloader, "_iterator", None)
+    if iterator is not None:
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            shutdown()
+        dataloader._iterator = None
+
+
 def _write_collection_parts(tmp_path, prefix: str, adatas):
     paths = []
     for idx, adata in enumerate(adatas):
@@ -123,6 +132,7 @@ def test_multivi_custom_dataloader_registry_and_batch_shapes(tmp_path):
         batch_key="batch",
         batch_size=len(obs_names),
         shuffle=False,
+        parallel=False,
         categorical_covariate_keys=["site"],
         continuous_covariate_keys=["score"],
     )
@@ -162,6 +172,7 @@ def test_multivi_custom_dataloader_train(tmp_path, fully_paired: bool, modality_
         batch_key="batch",
         batch_size=4,
         shuffle=False,
+        parallel=False,
         categorical_covariate_keys=["site"],
         continuous_covariate_keys=["score"],
     )
@@ -215,6 +226,7 @@ def test_multivi_custom_dataloader_single_modality(
         batch_key="batch",
         batch_size=4,
         shuffle=False,
+        parallel=False,
         categorical_covariate_keys=["site"],
         continuous_covariate_keys=["score"],
     )
@@ -263,13 +275,16 @@ def test_multivi_custom_dataloader_requires_collection():
 @pytest.mark.dataloader
 @dependencies("lamindb")
 def test_multivi_custom_dataloader_no_extra_cat_covs_uses_batch_and_trains(tmp_path):
-    rna_collection, atac_collection, _, _, _ = _make_multivi_collections(tmp_path, fully_paired=True)
+    rna_collection, atac_collection, _, _, _ = _make_multivi_collections(
+        tmp_path, fully_paired=True
+    )
     datamodule = MultiVIMappedCollectionDataModule(
         rna_collection=rna_collection,
         atac_collection=atac_collection,
         batch_key="batch",
         batch_size=4,
         shuffle=False,
+        parallel=False,
         categorical_covariate_keys=None,
     )
 
