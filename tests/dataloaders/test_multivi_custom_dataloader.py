@@ -132,7 +132,6 @@ def test_multivi_custom_dataloader_registry_and_batch_shapes(tmp_path):
         batch_key="batch",
         batch_size=len(obs_names),
         shuffle=False,
-        parallel=False,
         categorical_covariate_keys=["site"],
         continuous_covariate_keys=["score"],
     )
@@ -172,7 +171,6 @@ def test_multivi_custom_dataloader_train(tmp_path, fully_paired: bool, modality_
         batch_key="batch",
         batch_size=4,
         shuffle=False,
-        parallel=False,
         categorical_covariate_keys=["site"],
         continuous_covariate_keys=["score"],
     )
@@ -226,7 +224,6 @@ def test_multivi_custom_dataloader_single_modality(
         batch_key="batch",
         batch_size=4,
         shuffle=False,
-        parallel=False,
         categorical_covariate_keys=["site"],
         continuous_covariate_keys=["score"],
     )
@@ -284,7 +281,6 @@ def test_multivi_custom_dataloader_no_extra_cat_covs_uses_batch_and_trains(tmp_p
         batch_key="batch",
         batch_size=4,
         shuffle=False,
-        parallel=False,
         categorical_covariate_keys=None,
     )
 
@@ -338,5 +334,21 @@ def test_multivi_custom_dataloader_ddp_uses_batch_sampler(monkeypatch):
     dataloader = datamodule._create_dataloader(dataset, shuffle=False)
 
     assert isinstance(dataloader.batch_sampler, _DummyBatchDistributedSampler)
-    assert next(iter(dataloader)) == [0, 1]
+    sampled_batch = next(iter(dataloader.batch_sampler))
+    assert sampled_batch == [0, 1]
+    _ = [dataset[idx] for idx in sampled_batch]
     assert dataset.seen_index_types == [int, int]
+
+
+def test_multivi_custom_dataloader_non_ddp_uses_main_process_loader(monkeypatch):
+    monkeypatch.setattr(custom_dataloaders.dist, "is_available", lambda: False)
+    monkeypatch.setattr(custom_dataloaders.dist, "is_initialized", lambda: False)
+
+    datamodule = MultiVIMappedCollectionDataModule.__new__(MultiVIMappedCollectionDataModule)
+    datamodule._batch_size = 2
+    datamodule._collate_fn = lambda batch_indices: batch_indices
+
+    dataset = custom_dataloaders._IndexDataset(np.arange(4, dtype=np.int64))
+    dataloader = datamodule._create_dataloader(dataset, shuffle=False)
+
+    assert dataloader.num_workers == 0
