@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from lightning.pytorch import LightningDataModule
-from scipy.sparse import issparse
+from scipy.sparse import csr_matrix, issparse, vstack
 from sklearn.preprocessing import LabelEncoder
 from torch.utils.data import DataLoader, Dataset
 
@@ -487,8 +487,17 @@ class _CollectionBackedAnnData:
         self._adatas = [None] * len(self._artifacts)
         self._adatas_pid = None
 
-    def fetch_rows(self, obs_names: np.ndarray) -> np.ndarray:
+    def fetch_rows(
+        self,
+        obs_names: np.ndarray,
+        densify: bool = True,
+    ) -> np.ndarray | csr_matrix:
         out = np.zeros((len(obs_names), self.n_vars), dtype=np.float32)
+        sparse_rows: list[csr_matrix] | None = (
+            [csr_matrix((1, self.n_vars), dtype=np.float32) for _ in range(len(obs_names))]
+            if not densify
+            else None
+        )
         row_positions: dict[int, list[int]] = defaultdict(list)
         row_indices: dict[int, list[int]] = defaultdict(list)
         for out_idx, obs_name in enumerate(obs_names):
@@ -504,14 +513,31 @@ class _CollectionBackedAnnData:
             sort_order = np.argsort(artifact_row_indices)
             sorted_row_indices = artifact_row_indices[sort_order]
             matrix = self._get_adata(artifact_idx)[sorted_row_indices].X
-            if issparse(matrix):
-                matrix = matrix.toarray()
+            matrix_is_sparse = issparse(matrix)
+            if matrix_is_sparse:
+                matrix = matrix.tocsr()
             else:
                 matrix = np.asarray(matrix)
             inverse_order = np.empty_like(sort_order)
             inverse_order[sort_order] = np.arange(len(sort_order))
             matrix = matrix[inverse_order]
-            out[np.asarray(positions, dtype=np.int64)] = matrix.astype(np.float32, copy=False)
+            output_positions = np.asarray(positions, dtype=np.int64)
+            if sparse_rows is not None and matrix_is_sparse:
+                for row_idx, output_position in enumerate(output_positions):
+                    sparse_rows[output_position] = matrix[row_idx].astype(np.float32, copy=False)
+            else:
+                if sparse_rows is not None:
+                    out = (
+                        vstack(sparse_rows, format="csr")
+                        .toarray()
+                        .astype(np.float32, copy=False)
+                    )
+                    sparse_rows = None
+                if issparse(matrix):
+                    matrix = matrix.toarray()
+                out[output_positions] = np.asarray(matrix, dtype=np.float32)
+        if sparse_rows is not None:
+            return vstack(sparse_rows, format="csr")
         return out
 
     @staticmethod
@@ -604,6 +630,16 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         Optional list of obs keys for categorical covariates.
     continuous_covariate_keys
         Optional list of obs keys for continuous covariates.
+    sparse_atac
+        If ``True``, preserve sparse ATAC batches from the collection and emit
+        :func:`torch.sparse_csr_tensor` in the collate function when possible. For ATAC peak
+        matrices with hundreds of thousands of regions, dense per-batch tensors can exceed GPU
+        memory. Keeping ATAC sparse end-to-end avoids materializing a
+        ``(batch_size, n_regions)`` dense tensor on the CPU side. Set ``sparse_atac=False`` if
+        your model's ATAC encoder requires dense input. Some model paths may densify on-device.
+    sparse_rna
+        If ``True``, preserve sparse RNA batches and emit :func:`torch.sparse_csr_tensor` when
+        possible.
     drop_dataset_tail
         When running under DDP, whether to drop the tail of the dataset to make it
         evenly divisible by the number of replicas. Passed to
@@ -650,6 +686,8 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         shuffle: bool = True,
         categorical_covariate_keys: list[str] | None = None,
         continuous_covariate_keys: list[str] | None = None,
+        sparse_atac: bool = False,
+        sparse_rna: bool = False,
         drop_dataset_tail: bool = False,
         drop_last: bool = False,
     ):
@@ -666,6 +704,8 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         self.model_name = "MULTIVI"
         self._categorical_covariate_keys = categorical_covariate_keys
         self._continuous_covariate_keys = continuous_covariate_keys
+        self._sparse_atac = sparse_atac
+        self._sparse_rna = sparse_rna
         self._log_hyperparams = False
         self.allow_zero_length_dataloader_with_multiple_devices = False
 
@@ -979,22 +1019,36 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
             collate_fn=self._collate_fn,
         )
 
-    @staticmethod
     def _fetch_modality_tensor(
-        source: _CollectionBackedAnnData | None, obs_names: np.ndarray
+        self,
+        source: _CollectionBackedAnnData | None,
+        obs_names: np.ndarray,
+        sparse: bool,
     ) -> torch.Tensor:
-        matrix = (
-            source.fetch_rows(obs_names)
-            if source is not None
-            else np.zeros((len(obs_names), 0), dtype=np.float32)
-        )
-        return torch.from_numpy(matrix)
+        if source is None:
+            return torch.zeros((len(obs_names), 0), dtype=torch.float32)
+        matrix = source.fetch_rows(obs_names, densify=not sparse)
+        if sparse and issparse(matrix):
+            csr = matrix.tocsr()
+            return torch.sparse_csr_tensor(
+                crow_indices=torch.from_numpy(csr.indptr.astype(np.int64, copy=False)),
+                col_indices=torch.from_numpy(csr.indices.astype(np.int64, copy=False)),
+                values=torch.from_numpy(csr.data.astype(np.float32, copy=False)),
+                size=csr.shape,
+            )
+        if issparse(matrix):
+            matrix = matrix.toarray()
+        return torch.from_numpy(np.asarray(matrix, dtype=np.float32))
 
     def _collate_fn(self, batch_indices: list[int]) -> dict[str, torch.Tensor | None]:
         indices = np.asarray(batch_indices, dtype=np.int64)
         obs_names = self._global_obs_names[indices]
-        rna_tensor = self._fetch_modality_tensor(self._rna_source, obs_names)
-        atac_tensor = self._fetch_modality_tensor(self._atac_source, obs_names)
+        rna_tensor = self._fetch_modality_tensor(
+            self._rna_source, obs_names, sparse=self._sparse_rna
+        )
+        atac_tensor = self._fetch_modality_tensor(
+            self._atac_source, obs_names, sparse=self._sparse_atac
+        )
         batch = {
             REGISTRY_KEYS.X_KEY: rna_tensor,
             REGISTRY_KEYS.ATAC_X_KEY: atac_tensor,
