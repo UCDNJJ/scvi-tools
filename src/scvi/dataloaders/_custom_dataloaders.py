@@ -12,7 +12,7 @@ import torch.distributed as dist
 from lightning.pytorch import LightningDataModule
 from scipy.sparse import csr_matrix, issparse, vstack
 from sklearn.preprocessing import LabelEncoder
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, get_worker_info
 
 import scvi
 from scvi import REGISTRY_KEYS
@@ -490,6 +490,46 @@ class _IndexDataset(Dataset):
         return int(self.indices[index])
 
 
+class _MappedCollectionDataset(Dataset):
+    def __init__(
+        self,
+        dataset: Dataset,
+        mapped_indices: np.ndarray,
+        public_indices: np.ndarray | None = None,
+    ):
+        self.dataset = dataset
+        self.mapped_indices = np.asarray(mapped_indices, dtype=np.int64)
+        self.public_indices = (
+            np.asarray(public_indices, dtype=np.int64)
+            if public_indices is not None
+            else np.arange(len(self.mapped_indices), dtype=np.int64)
+        )
+
+    def __len__(self) -> int:
+        return len(self.mapped_indices)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        sample = dict(self.dataset[int(self.mapped_indices[index])])
+        sample["_indices"] = int(self.public_indices[index])
+        return sample
+
+    @staticmethod
+    def torch_worker_init_fn(worker_id: int) -> None:
+        del worker_id
+        dataset = get_worker_info().dataset
+        mapped = dataset.dataset
+        if hasattr(mapped, "parallel"):
+            mapped.parallel = False
+        if hasattr(mapped, "storages"):
+            mapped.storages = []
+        if hasattr(mapped, "conns"):
+            mapped.conns = []
+        make_connections = getattr(mapped, "_make_connections", None)
+        path_list = getattr(mapped, "path_list", None)
+        if callable(make_connections) and path_list is not None:
+            make_connections(path_list, parallel=False)
+
+
 class _CollectionBackedAnnData:
     def __init__(
         self,
@@ -500,6 +540,7 @@ class _CollectionBackedAnnData:
         self._obs_columns = list(dict.fromkeys(obs_columns))
         self._adatas: list[AnnData | None] = [None] * len(self._artifacts)
         self._adatas_pid: int | None = None
+        self._artifact_n_obs: list[int] = [0] * len(self._artifacts)
         self.obs_to_location: dict[str, tuple[int, int]] = {}
         self.obs_metadata: dict[str, dict[str, object]] = {}
         self.var_names: np.ndarray | None = None
@@ -553,34 +594,42 @@ class _CollectionBackedAnnData:
             row_positions[artifact_idx].append(out_idx)
             row_indices[artifact_idx].append(row_idx)
 
+        close_after_fetch = self._is_worker_process()
         for artifact_idx, positions in row_positions.items():
-            artifact_row_indices = np.asarray(row_indices[artifact_idx], dtype=np.int64)
-            sort_order = np.argsort(artifact_row_indices)
-            sorted_row_indices = artifact_row_indices[sort_order]
-            matrix = self._get_adata(artifact_idx)[sorted_row_indices].X
-            matrix_is_sparse = issparse(matrix)
-            if matrix_is_sparse:
-                matrix = matrix.tocsr()
-            else:
-                matrix = np.asarray(matrix)
-            inverse_order = np.empty_like(sort_order)
-            inverse_order[sort_order] = np.arange(len(sort_order))
-            matrix = matrix[inverse_order]
-            output_positions = np.asarray(positions, dtype=np.int64)
-            if sparse_rows is not None and matrix_is_sparse:
-                for row_idx, output_position in enumerate(output_positions):
-                    sparse_rows[output_position] = matrix[row_idx].astype(np.float32, copy=False)
-            else:
-                if sparse_rows is not None:
-                    out = (
-                        vstack(sparse_rows, format="csr")
-                        .toarray()
-                        .astype(np.float32, copy=False)
-                    )
-                    sparse_rows = None
-                if issparse(matrix):
-                    matrix = matrix.toarray()
-                out[output_positions] = np.asarray(matrix, dtype=np.float32)
+            adata = self._get_adata(artifact_idx)
+            try:
+                artifact_row_indices = np.asarray(row_indices[artifact_idx], dtype=np.int64)
+                sort_order = np.argsort(artifact_row_indices)
+                sorted_row_indices = artifact_row_indices[sort_order]
+                matrix = adata[sorted_row_indices].X
+                matrix_is_sparse = issparse(matrix)
+                if matrix_is_sparse:
+                    matrix = matrix.tocsr()
+                else:
+                    matrix = np.asarray(matrix)
+                inverse_order = np.empty_like(sort_order)
+                inverse_order[sort_order] = np.arange(len(sort_order))
+                matrix = matrix[inverse_order]
+                output_positions = np.asarray(positions, dtype=np.int64)
+                if sparse_rows is not None and matrix_is_sparse:
+                    for row_idx, output_position in enumerate(output_positions):
+                        sparse_rows[output_position] = matrix[row_idx].astype(
+                            np.float32, copy=False
+                        )
+                else:
+                    if sparse_rows is not None:
+                        out = (
+                            vstack(sparse_rows, format="csr")
+                            .toarray()
+                            .astype(np.float32, copy=False)
+                        )
+                        sparse_rows = None
+                    if issparse(matrix):
+                        matrix = matrix.toarray()
+                    out[output_positions] = np.asarray(matrix, dtype=np.float32)
+            finally:
+                if close_after_fetch:
+                    self._close_adata(adata)
         if sparse_rows is not None:
             return vstack(sparse_rows, format="csr")
         return out
@@ -620,6 +669,7 @@ class _CollectionBackedAnnData:
             )
 
     def _register_obs(self, artifact_idx: int, adata: AnnData) -> None:
+        self._artifact_n_obs[artifact_idx] = adata.n_obs
         obs_frame = adata.obs.reindex(columns=self._obs_columns, fill_value=None)
         for row_idx, obs_name in enumerate(adata.obs_names.astype(str)):
             if obs_name in self.obs_to_location:
@@ -636,6 +686,7 @@ class _CollectionBackedAnnData:
         obs_names: np.ndarray,
         obs_data: dict[str, np.ndarray],
     ) -> None:
+        self._artifact_n_obs[artifact_idx] = len(obs_names)
         seen_obs_names = set(self.obs_to_location)
         for obs_name in obs_names:
             if obs_name in seen_obs_names:
@@ -665,11 +716,17 @@ class _CollectionBackedAnnData:
             }
         )
 
+    @staticmethod
+    def _is_worker_process() -> bool:
+        return get_worker_info() is not None
+
     def _get_adata(self, artifact_idx: int) -> AnnData:
         current_pid = os.getpid()
         if self._adatas_pid != current_pid:
             self.close()
             self._adatas_pid = current_pid
+        if self._is_worker_process():
+            return self._open_artifact(self._artifacts[artifact_idx])
         adata = self._adatas[artifact_idx]
         if adata is None:
             adata = self._open_artifact(self._artifacts[artifact_idx])
@@ -818,6 +875,9 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         if continuous_covariate_keys is not None:
             obs_columns.extend(continuous_covariate_keys)
 
+        self._mapped_atac_dataset = None
+        self._mapped_atac_indices = None
+
         self._rna_source = (
             _CollectionBackedAnnData(rna_collection, obs_columns)
             if rna_collection is not None
@@ -839,9 +899,19 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         )
         self._metadata = self._build_metadata()
         self._init_encoders()
-        self._dataset = _IndexDataset(np.arange(self.n_obs, dtype=np.int64))
+        if rna_collection is None and atac_collection is not None:
+            self._mapped_atac_dataset = atac_collection.mapped(parallel=True)
+            self._mapped_atac_indices = self._build_mapped_indices(self._atac_source)
+            self._dataset = _MappedCollectionDataset(
+                self._mapped_atac_dataset,
+                self._mapped_atac_indices,
+            )
+        else:
+            self._dataset = _IndexDataset(np.arange(self.n_obs, dtype=np.int64))
 
     def close(self):
+        if self._mapped_atac_dataset is not None:
+            self._mapped_atac_dataset.close()
         for source in self._sources:
             source.close()
 
@@ -1024,6 +1094,13 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
     ):
         if indices is None:
             dataset = self._dataset
+        elif self._mapped_atac_dataset is not None:
+            indices = np.asarray(indices, dtype=np.int64)
+            dataset = _MappedCollectionDataset(
+                self._mapped_atac_dataset,
+                self._mapped_atac_indices[indices],
+                public_indices=indices,
+            )
         else:
             dataset = _IndexDataset(np.asarray(indices, dtype=np.int64))
         return self._create_dataloader(dataset, shuffle=shuffle, batch_size=batch_size)
@@ -1111,6 +1188,8 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
                 getattr(self, "_persistent_workers", False) if num_workers > 0 else False
             ),
         }
+        if num_workers > 0 and isinstance(dataset, _MappedCollectionDataset):
+            dataloader_kwargs["worker_init_fn"] = dataset.torch_worker_init_fn
         prefetch_factor = getattr(self, "_prefetch_factor", None)
         if num_workers > 0 and prefetch_factor is not None:
             dataloader_kwargs["prefetch_factor"] = prefetch_factor
@@ -1155,7 +1234,81 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
             matrix = matrix.toarray()
         return torch.from_numpy(np.asarray(matrix, dtype=np.float32))
 
-    def _collate_fn(self, batch_indices: list[int]) -> dict[str, torch.Tensor | None]:
+    def _build_mapped_indices(self, source: _CollectionBackedAnnData | None) -> np.ndarray:
+        if source is None:
+            return np.array([], dtype=np.int64)
+        offsets = np.cumsum([0, *source._artifact_n_obs[:-1]], dtype=np.int64)
+        return np.asarray(
+            [
+                offsets[artifact_idx] + row_idx
+                for artifact_idx, row_idx in (
+                    source.obs_to_location[obs_name] for obs_name in self._global_obs_names
+                )
+            ],
+            dtype=np.int64,
+        )
+
+    def _collate_mapped_atac_only_batch(
+        self, batch: list[dict[str, object]]
+    ) -> dict[str, torch.Tensor | None]:
+        indices = np.asarray([item["_indices"] for item in batch], dtype=np.int64)
+        if self._sparse_atac:
+            rows = [item["X"] for item in batch]
+            if any(issparse(row) for row in rows):
+                atac_rows = []
+                for row in rows:
+                    if issparse(row):
+                        atac_rows.append(row.tocsr())
+                    else:
+                        atac_rows.append(
+                            csr_matrix(np.asarray(row, dtype=np.float32).reshape(1, -1))
+                        )
+                atac_csr = vstack(atac_rows, format="csr")
+            else:
+                atac_csr = csr_matrix(np.asarray(rows, dtype=np.float32))
+            atac_tensor = torch.sparse_csr_tensor(
+                crow_indices=torch.from_numpy(atac_csr.indptr.astype(np.int64, copy=False)),
+                col_indices=torch.from_numpy(atac_csr.indices.astype(np.int64, copy=False)),
+                values=torch.from_numpy(atac_csr.data.astype(np.float32, copy=False)),
+                size=atac_csr.shape,
+            )
+        else:
+            atac_matrix = np.asarray(
+                [
+                    (
+                        row.toarray().ravel()
+                        if issparse(row := item["X"])
+                        else np.asarray(row).ravel()
+                    )
+                    for item in batch
+                ],
+                dtype=np.float32,
+            )
+            atac_tensor = torch.from_numpy(atac_matrix)
+        return {
+            REGISTRY_KEYS.X_KEY: torch.zeros((len(indices), 0), dtype=torch.float32),
+            REGISTRY_KEYS.ATAC_X_KEY: atac_tensor,
+            "atac_X": atac_tensor,
+            REGISTRY_KEYS.BATCH_KEY: torch.from_numpy(self._batch_codes[indices][:, None]),
+            REGISTRY_KEYS.LABELS_KEY: torch.zeros((len(indices), 1), dtype=torch.int64),
+            REGISTRY_KEYS.INDICES_KEY: torch.from_numpy(indices[:, None]),
+            REGISTRY_KEYS.CAT_COVS_KEY: (
+                torch.from_numpy(self._categorical_covariates[indices])
+                if self._categorical_covariates is not None
+                else None
+            ),
+            REGISTRY_KEYS.CONT_COVS_KEY: (
+                torch.from_numpy(self._continuous_covariates[indices])
+                if self._continuous_covariates is not None
+                else None
+            ),
+        }
+
+    def _collate_fn(
+        self, batch_indices: list[int] | list[dict[str, object]]
+    ) -> dict[str, torch.Tensor | None]:
+        if batch_indices and isinstance(batch_indices[0], dict):
+            return self._collate_mapped_atac_only_batch(batch_indices)
         indices = np.asarray(batch_indices, dtype=np.int64)
         obs_names = self._global_obs_names[indices]
         rna_tensor = self._fetch_modality_tensor(

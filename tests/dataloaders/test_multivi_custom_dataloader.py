@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 from anndata import AnnData
+from pandas.api.types import is_string_dtype
 from scipy.sparse import csr_matrix, issparse
 
 import scvi
@@ -38,6 +40,42 @@ class _FakeArtifacts:
 class _FakeCollection:
     def __init__(self, paths: list[str]):
         self.artifacts = _FakeArtifacts([_FakeArtifact(path) for path in paths])
+        self.mapped_calls = []
+
+    def mapped(self, *args, **kwargs):
+        self.mapped_calls.append({"args": args, "kwargs": kwargs})
+        return _FakeMappedCollection(self.artifacts.all())
+
+
+class _FakeMappedCollection:
+    def __init__(self, artifacts):
+        self._artifacts = artifacts
+        self._adatas = [artifact.load() for artifact in artifacts]
+        self._offsets = np.cumsum([0, *(adata.n_obs for adata in self._adatas[:-1])], dtype=np.int64)
+        self.n_obs = sum(adata.n_obs for adata in self._adatas)
+        self.var_joint = pd.Index(np.asarray(self._adatas[0].var_names, dtype=object), dtype=object)
+        self.n_vars = len(self.var_joint)
+
+    def __getitem__(self, index: int):
+        index = int(index)
+        artifact_idx = np.searchsorted(self._offsets, index, side="right") - 1
+        row_idx = index - self._offsets[artifact_idx]
+        row = self._adatas[artifact_idx].X[row_idx]
+        if issparse(row):
+            row = row.toarray().ravel()
+        else:
+            row = np.asarray(row).ravel()
+        return {"X": np.asarray(row, dtype=np.float32)}
+
+    def __len__(self):
+        return self.n_obs
+
+    def close(self):
+        return None
+
+    @staticmethod
+    def torch_worker_init_fn(worker_id: int):
+        return None
 
 
 def _shutdown_workers(dataloader) -> None:
@@ -493,6 +531,27 @@ def test_multivi_custom_dataloader_non_ddp_uses_main_process_loader(monkeypatch)
 
 @pytest.mark.dataloader
 @dependencies("lamindb")
+def test_multivi_custom_dataloader_atac_only_uses_mapped_backend(tmp_path):
+    _, atac_collection, _, _, _ = _make_multivi_collections(tmp_path, fully_paired=False)
+    datamodule = MultiVIMappedCollectionDataModule(
+        rna_collection=None,
+        atac_collection=atac_collection,
+        batch_key="batch",
+        batch_size=4,
+        shuffle=False,
+        num_workers=2,
+    )
+
+    assert len(atac_collection.mapped_calls) == 1
+    assert atac_collection.mapped_calls[0]["kwargs"] == {"parallel": True}
+
+    dataloader = datamodule.train_dataloader()
+    assert dataloader.worker_init_fn == datamodule._dataset.torch_worker_init_fn
+    _shutdown_workers(dataloader)
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
 def test_fetch_rows_returns_sparse_when_densify_false(tmp_path):
     source = _make_sparse_collection_source(tmp_path)
     obs_names = np.array(["cell_4", "cell_0", "cell_3", "cell_1"], dtype=object)
@@ -511,6 +570,54 @@ def test_fetch_rows_dense_when_densify_true(tmp_path):
     obs_names = np.array(["cell_4", "cell_0", "cell_3", "cell_1"], dtype=object)
     dense_matrix = source.fetch_rows(obs_names, densify=True)
     assert isinstance(dense_matrix, np.ndarray)
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_fetch_rows_worker_process_does_not_cache_adatas(tmp_path, monkeypatch):
+    source = _make_sparse_collection_source(tmp_path)
+    obs_names = np.array(["cell_4", "cell_0", "cell_3", "cell_1"], dtype=object)
+    opened_adatas = []
+    closed_adatas = []
+
+    monkeypatch.setattr(
+        custom_dataloaders,
+        "get_worker_info",
+        lambda: SimpleNamespace(id=0, num_workers=1),
+    )
+
+    original_open_artifact = source._open_artifact
+    original_close_adata = source._close_adata
+
+    def _tracking_open_artifact(artifact):
+        adata = original_open_artifact(artifact)
+        opened_adatas.append(adata)
+        return adata
+
+    def _tracking_close_adata(adata):
+        closed_adatas.append(adata)
+        original_close_adata(adata)
+
+    monkeypatch.setattr(source, "_open_artifact", _tracking_open_artifact)
+    monkeypatch.setattr(source, "_close_adata", _tracking_close_adata)
+
+    dense_matrix = source.fetch_rows(obs_names, densify=True)
+    np.testing.assert_allclose(
+        dense_matrix,
+        np.array(
+            [[0.0, 5.0, 0.0], [1.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+            dtype=np.float32,
+        ),
+    )
+    non_null_closed_adatas = [adata for adata in closed_adatas if adata is not None]
+    assert source._adatas == [None] * len(source._artifacts)
+    assert len(opened_adatas) == 2
+    assert len(non_null_closed_adatas) == 2
+
+    source.fetch_rows(obs_names, densify=True)
+    assert source._adatas == [None] * len(source._artifacts)
+    assert len(opened_adatas) == 4
+    assert len([adata for adata in closed_adatas if adata is not None]) == 4
 
 
 @pytest.mark.dataloader
