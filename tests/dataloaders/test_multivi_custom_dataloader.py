@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -522,7 +523,11 @@ def test_fetch_rows_worker_process_does_not_cache_adatas(tmp_path, monkeypatch):
     opened_adatas = []
     closed_adatas = []
 
-    monkeypatch.setattr(custom_dataloaders, "get_worker_info", lambda: object())
+    monkeypatch.setattr(
+        custom_dataloaders,
+        "get_worker_info",
+        lambda: SimpleNamespace(id=0, num_workers=1),
+    )
 
     original_open_artifact = source._open_artifact
     original_close_adata = source._close_adata
@@ -547,10 +552,10 @@ def test_fetch_rows_worker_process_does_not_cache_adatas(tmp_path, monkeypatch):
             dtype=np.float32,
         ),
     )
-    closed_opened_adatas = [adata for adata in closed_adatas if adata is not None]
+    non_null_closed_adatas = [adata for adata in closed_adatas if adata is not None]
     assert source._adatas == [None] * len(source._artifacts)
     assert len(opened_adatas) == 2
-    assert len(closed_opened_adatas) == 2
+    assert len(non_null_closed_adatas) == 2
 
     source.fetch_rows(obs_names, densify=True)
     assert source._adatas == [None] * len(source._artifacts)
