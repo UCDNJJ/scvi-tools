@@ -12,7 +12,7 @@ import torch.distributed as dist
 from lightning.pytorch import LightningDataModule
 from scipy.sparse import csr_matrix, issparse, vstack
 from sklearn.preprocessing import LabelEncoder
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, get_worker_info
 
 import scvi
 from scvi import REGISTRY_KEYS
@@ -553,34 +553,42 @@ class _CollectionBackedAnnData:
             row_positions[artifact_idx].append(out_idx)
             row_indices[artifact_idx].append(row_idx)
 
+        close_after_fetch = self._is_worker_process()
         for artifact_idx, positions in row_positions.items():
-            artifact_row_indices = np.asarray(row_indices[artifact_idx], dtype=np.int64)
-            sort_order = np.argsort(artifact_row_indices)
-            sorted_row_indices = artifact_row_indices[sort_order]
-            matrix = self._get_adata(artifact_idx)[sorted_row_indices].X
-            matrix_is_sparse = issparse(matrix)
-            if matrix_is_sparse:
-                matrix = matrix.tocsr()
-            else:
-                matrix = np.asarray(matrix)
-            inverse_order = np.empty_like(sort_order)
-            inverse_order[sort_order] = np.arange(len(sort_order))
-            matrix = matrix[inverse_order]
-            output_positions = np.asarray(positions, dtype=np.int64)
-            if sparse_rows is not None and matrix_is_sparse:
-                for row_idx, output_position in enumerate(output_positions):
-                    sparse_rows[output_position] = matrix[row_idx].astype(np.float32, copy=False)
-            else:
-                if sparse_rows is not None:
-                    out = (
-                        vstack(sparse_rows, format="csr")
-                        .toarray()
-                        .astype(np.float32, copy=False)
-                    )
-                    sparse_rows = None
-                if issparse(matrix):
-                    matrix = matrix.toarray()
-                out[output_positions] = np.asarray(matrix, dtype=np.float32)
+            adata = self._get_adata(artifact_idx)
+            try:
+                artifact_row_indices = np.asarray(row_indices[artifact_idx], dtype=np.int64)
+                sort_order = np.argsort(artifact_row_indices)
+                sorted_row_indices = artifact_row_indices[sort_order]
+                matrix = adata[sorted_row_indices].X
+                matrix_is_sparse = issparse(matrix)
+                if matrix_is_sparse:
+                    matrix = matrix.tocsr()
+                else:
+                    matrix = np.asarray(matrix)
+                inverse_order = np.empty_like(sort_order)
+                inverse_order[sort_order] = np.arange(len(sort_order))
+                matrix = matrix[inverse_order]
+                output_positions = np.asarray(positions, dtype=np.int64)
+                if sparse_rows is not None and matrix_is_sparse:
+                    for row_idx, output_position in enumerate(output_positions):
+                        sparse_rows[output_position] = matrix[row_idx].astype(
+                            np.float32, copy=False
+                        )
+                else:
+                    if sparse_rows is not None:
+                        out = (
+                            vstack(sparse_rows, format="csr")
+                            .toarray()
+                            .astype(np.float32, copy=False)
+                        )
+                        sparse_rows = None
+                    if issparse(matrix):
+                        matrix = matrix.toarray()
+                    out[output_positions] = np.asarray(matrix, dtype=np.float32)
+            finally:
+                if close_after_fetch:
+                    self._close_adata(adata)
         if sparse_rows is not None:
             return vstack(sparse_rows, format="csr")
         return out
@@ -665,11 +673,17 @@ class _CollectionBackedAnnData:
             }
         )
 
+    @staticmethod
+    def _is_worker_process() -> bool:
+        return get_worker_info() is not None
+
     def _get_adata(self, artifact_idx: int) -> AnnData:
         current_pid = os.getpid()
         if self._adatas_pid != current_pid:
             self.close()
             self._adatas_pid = current_pid
+        if self._is_worker_process():
+            return self._open_artifact(self._artifacts[artifact_idx])
         adata = self._adatas[artifact_idx]
         if adata is None:
             adata = self._open_artifact(self._artifacts[artifact_idx])

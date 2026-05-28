@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 import torch
 from anndata import AnnData
+from pandas.api.types import is_string_dtype
 from scipy.sparse import csr_matrix, issparse
 
 import scvi
@@ -511,6 +512,50 @@ def test_fetch_rows_dense_when_densify_true(tmp_path):
     obs_names = np.array(["cell_4", "cell_0", "cell_3", "cell_1"], dtype=object)
     dense_matrix = source.fetch_rows(obs_names, densify=True)
     assert isinstance(dense_matrix, np.ndarray)
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_fetch_rows_worker_process_does_not_cache_adatas(tmp_path, monkeypatch):
+    source = _make_sparse_collection_source(tmp_path)
+    obs_names = np.array(["cell_4", "cell_0", "cell_3", "cell_1"], dtype=object)
+    opened_adatas = []
+    closed_adatas = []
+
+    monkeypatch.setattr(custom_dataloaders, "get_worker_info", lambda: object())
+
+    original_open_artifact = source._open_artifact
+    original_close_adata = source._close_adata
+
+    def _tracking_open_artifact(artifact):
+        adata = original_open_artifact(artifact)
+        opened_adatas.append(adata)
+        return adata
+
+    def _tracking_close_adata(adata):
+        closed_adatas.append(adata)
+        original_close_adata(adata)
+
+    monkeypatch.setattr(source, "_open_artifact", _tracking_open_artifact)
+    monkeypatch.setattr(source, "_close_adata", _tracking_close_adata)
+
+    dense_matrix = source.fetch_rows(obs_names, densify=True)
+    np.testing.assert_allclose(
+        dense_matrix,
+        np.array(
+            [[0.0, 5.0, 0.0], [1.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+            dtype=np.float32,
+        ),
+    )
+    closed_opened_adatas = [adata for adata in closed_adatas if adata is not None]
+    assert source._adatas == [None] * len(source._artifacts)
+    assert len(opened_adatas) == 2
+    assert len(closed_opened_adatas) == 2
+
+    source.fetch_rows(obs_names, densify=True)
+    assert source._adatas == [None] * len(source._artifacts)
+    assert len(opened_adatas) == 4
+    assert len([adata for adata in closed_adatas if adata is not None]) == 4
 
 
 @pytest.mark.dataloader
