@@ -40,6 +40,42 @@ class _FakeArtifacts:
 class _FakeCollection:
     def __init__(self, paths: list[str]):
         self.artifacts = _FakeArtifacts([_FakeArtifact(path) for path in paths])
+        self.mapped_calls = []
+
+    def mapped(self, *args, **kwargs):
+        self.mapped_calls.append({"args": args, "kwargs": kwargs})
+        return _FakeMappedCollection(self.artifacts.all())
+
+
+class _FakeMappedCollection:
+    def __init__(self, artifacts):
+        self._artifacts = artifacts
+        self._adatas = [artifact.load() for artifact in artifacts]
+        self._offsets = np.cumsum([0, *(adata.n_obs for adata in self._adatas[:-1])], dtype=np.int64)
+        self.n_obs = sum(adata.n_obs for adata in self._adatas)
+        self.var_joint = pd.Index(np.asarray(self._adatas[0].var_names, dtype=object), dtype=object)
+        self.n_vars = len(self.var_joint)
+
+    def __getitem__(self, index: int):
+        index = int(index)
+        artifact_idx = np.searchsorted(self._offsets, index, side="right") - 1
+        row_idx = index - self._offsets[artifact_idx]
+        row = self._adatas[artifact_idx].X[row_idx]
+        if issparse(row):
+            row = row.toarray().ravel()
+        else:
+            row = np.asarray(row).ravel()
+        return {"X": np.asarray(row, dtype=np.float32)}
+
+    def __len__(self):
+        return self.n_obs
+
+    def close(self):
+        return None
+
+    @staticmethod
+    def torch_worker_init_fn(worker_id: int):
+        return None
 
 
 def _shutdown_workers(dataloader) -> None:
@@ -491,6 +527,27 @@ def test_multivi_custom_dataloader_non_ddp_uses_main_process_loader(monkeypatch)
     dataloader = datamodule._create_dataloader(dataset, shuffle=False)
 
     assert dataloader.num_workers == 0
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_multivi_custom_dataloader_atac_only_uses_mapped_backend(tmp_path):
+    _, atac_collection, _, _, _ = _make_multivi_collections(tmp_path, fully_paired=False)
+    datamodule = MultiVIMappedCollectionDataModule(
+        rna_collection=None,
+        atac_collection=atac_collection,
+        batch_key="batch",
+        batch_size=4,
+        shuffle=False,
+        num_workers=2,
+    )
+
+    assert len(atac_collection.mapped_calls) == 1
+    assert atac_collection.mapped_calls[0]["kwargs"] == {"parallel": True}
+
+    dataloader = datamodule.train_dataloader()
+    assert dataloader.worker_init_fn == datamodule._dataset.torch_worker_init_fn
+    _shutdown_workers(dataloader)
 
 
 @pytest.mark.dataloader
