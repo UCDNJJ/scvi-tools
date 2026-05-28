@@ -1252,10 +1252,39 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         self, batch: list[dict[str, object]]
     ) -> dict[str, torch.Tensor | None]:
         indices = np.asarray([item["_indices"] for item in batch], dtype=np.int64)
-        atac_matrix = np.asarray([item["X"] for item in batch], dtype=np.float32)
-        atac_tensor = torch.from_numpy(atac_matrix)
         if self._sparse_atac:
-            atac_tensor = atac_tensor.to_sparse_csr()
+            rows = [item["X"] for item in batch]
+            if any(issparse(row) for row in rows):
+                atac_rows = []
+                for row in rows:
+                    if issparse(row):
+                        atac_rows.append(row.tocsr())
+                    else:
+                        atac_rows.append(
+                            csr_matrix(np.asarray(row, dtype=np.float32).reshape(1, -1))
+                        )
+                atac_csr = vstack(atac_rows, format="csr")
+            else:
+                atac_csr = csr_matrix(np.asarray(rows, dtype=np.float32))
+            atac_tensor = torch.sparse_csr_tensor(
+                crow_indices=torch.from_numpy(atac_csr.indptr.astype(np.int64, copy=False)),
+                col_indices=torch.from_numpy(atac_csr.indices.astype(np.int64, copy=False)),
+                values=torch.from_numpy(atac_csr.data.astype(np.float32, copy=False)),
+                size=atac_csr.shape,
+            )
+        else:
+            atac_matrix = np.asarray(
+                [
+                    (
+                        row.toarray().ravel()
+                        if issparse(row := item["X"])
+                        else np.asarray(row).ravel()
+                    )
+                    for item in batch
+                ],
+                dtype=np.float32,
+            )
+            atac_tensor = torch.from_numpy(atac_matrix)
         return {
             REGISTRY_KEYS.X_KEY: torch.zeros((len(indices), 0), dtype=torch.float32),
             REGISTRY_KEYS.ATAC_X_KEY: atac_tensor,
