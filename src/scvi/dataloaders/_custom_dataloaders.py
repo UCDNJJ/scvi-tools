@@ -1200,7 +1200,7 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         }
         if self._is_mapped_atac_only_dataset(dataset):
             if num_workers > 0:
-                dataloader_kwargs["worker_init_fn"] = dataset.dataset.torch_worker_init_fn
+                dataloader_kwargs["worker_init_fn"] = self._get_mapped_atac_worker_init_fn(dataset)
         else:
             dataloader_kwargs["collate_fn"] = self._collate_fn
             if num_workers > 0 and isinstance(dataset, _MappedCollectionDataset):
@@ -1235,7 +1235,9 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         if requested_num_workers > 0:
             return requested_num_workers
         cpu_count = os.cpu_count()
-        return max((cpu_count - 1) if cpu_count is not None else 0, 0)
+        if cpu_count is None or cpu_count <= 1:
+            return 0
+        return cpu_count - 1
 
     def _is_mapped_atac_only_dataset(self, dataset: Dataset) -> bool:
         return (
@@ -1244,6 +1246,10 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
             and self._mapped_atac_dataset is not None
             and dataset.dataset is self._mapped_atac_dataset
         )
+
+    @staticmethod
+    def _get_mapped_atac_worker_init_fn(dataset: _MappedCollectionDataset):
+        return dataset.dataset.torch_worker_init_fn
 
     def _fetch_modality_tensor(
         self,
@@ -1283,7 +1289,10 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
     def _format_mapped_atac_only_batch(
         self, batch: dict[str, object]
     ) -> dict[str, torch.Tensor | None]:
-        indices = torch.as_tensor(batch["_indices"], dtype=torch.int64).reshape(-1)
+        indices = torch.as_tensor(batch["_indices"], dtype=torch.int64)
+        # Default collation collapses `_indices` to a scalar when `batch_size == 1`.
+        if indices.ndim == 0:
+            indices = indices[None]
         atac_batch = batch["X"]
         if self._sparse_atac:
             atac_matrix = np.asarray(atac_batch, dtype=np.float32)
@@ -1320,6 +1329,7 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         batch,
         dataloader_idx,
     ):
+        """Format mapped ATAC-only batches into the tensor dict expected by MultiVI."""
         del dataloader_idx
         if isinstance(batch, dict) and "_indices" in batch:
             return self._format_mapped_atac_only_batch(batch)
