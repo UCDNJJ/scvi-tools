@@ -543,6 +543,7 @@ class _CollectionBackedAnnData:
         self._artifact_n_obs: list[int] = [0] * len(self._artifacts)
         self.obs_to_location: dict[str, tuple[int, int]] = {}
         self.obs_metadata: dict[str, dict[str, object]] = {}
+        self.obs_names: list[str] = []
         self.var_names: np.ndarray | None = None
 
         for artifact_idx, artifact in enumerate(self._artifacts):
@@ -675,6 +676,7 @@ class _CollectionBackedAnnData:
             if obs_name in self.obs_to_location:
                 raise ValueError(f"Duplicate obs_name {obs_name!r} found in collection.")
             self.obs_to_location[obs_name] = (artifact_idx, row_idx)
+            self.obs_names.append(obs_name)
             self.obs_metadata[obs_name] = {
                 key: value.item() if hasattr(value, "item") else value
                 for key, value in obs_frame.iloc[row_idx].to_dict().items()
@@ -699,6 +701,7 @@ class _CollectionBackedAnnData:
                 for row_idx, obs_name in enumerate(obs_names)
             }
         )
+        self.obs_names.extend(obs_names.tolist())
         if not self._obs_columns:
             self.obs_metadata.update({obs_name: {} for obs_name in obs_names})
             return
@@ -877,6 +880,7 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
 
         self._mapped_atac_dataset = None
         self._mapped_atac_indices = None
+        self._mapped_atac_only = rna_collection is None and atac_collection is not None
 
         self._rna_source = (
             _CollectionBackedAnnData(rna_collection, obs_columns)
@@ -893,18 +897,20 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
         )
         obs_name_sets = [set(source.obs_to_location) for source in self._sources]
 
-        self._global_obs_names = np.array(
-            sorted(set.union(*obs_name_sets)),
-            dtype=object,
-        )
+        if self._mapped_atac_only:
+            self._global_obs_names = np.asarray(self._atac_source.obs_names, dtype=object)
+        else:
+            self._global_obs_names = np.array(
+                sorted(set.union(*obs_name_sets)),
+                dtype=object,
+            )
         self._metadata = self._build_metadata()
         self._init_encoders()
-        if rna_collection is None and atac_collection is not None:
+        if self._mapped_atac_only:
             self._mapped_atac_dataset = atac_collection.mapped(parallel=True)
-            self._mapped_atac_indices = self._build_mapped_indices(self._atac_source)
             self._dataset = _MappedCollectionDataset(
                 self._mapped_atac_dataset,
-                self._mapped_atac_indices,
+                np.arange(self.n_obs, dtype=np.int64),
             )
         else:
             self._dataset = _IndexDataset(np.arange(self.n_obs, dtype=np.int64))
@@ -1098,12 +1104,17 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
             indices = np.asarray(indices, dtype=np.int64)
             dataset = _MappedCollectionDataset(
                 self._mapped_atac_dataset,
-                self._mapped_atac_indices[indices],
+                indices,
                 public_indices=indices,
             )
         else:
             dataset = _IndexDataset(np.asarray(indices, dtype=np.int64))
-        return self._create_dataloader(dataset, shuffle=shuffle, batch_size=batch_size)
+        dataloader = self._create_dataloader(dataset, shuffle=shuffle, batch_size=batch_size)
+        if self._is_mapped_atac_only_dataset(dataset):
+            return MappedCollectionDataModule._InferenceDataloader(
+                dataloader, self.on_before_batch_transfer
+            )
+        return dataloader
 
     def _build_metadata(self) -> dict[str, dict[str, object]]:
         metadata: dict[str, dict[str, object]] = {}
@@ -1179,17 +1190,21 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
     ) -> DataLoader:
         if batch_size is None:
             batch_size = self._batch_size
-        num_workers = getattr(self, "_num_workers", 0)
+        num_workers = self._get_num_workers(dataset)
         dataloader_kwargs = {
-            "collate_fn": self._collate_fn,
             "num_workers": num_workers,
             "pin_memory": getattr(self, "_pin_memory", False),
             "persistent_workers": (
                 getattr(self, "_persistent_workers", False) if num_workers > 0 else False
             ),
         }
-        if num_workers > 0 and isinstance(dataset, _MappedCollectionDataset):
-            dataloader_kwargs["worker_init_fn"] = dataset.torch_worker_init_fn
+        if self._is_mapped_atac_only_dataset(dataset):
+            if num_workers > 0:
+                dataloader_kwargs["worker_init_fn"] = dataset.dataset.torch_worker_init_fn
+        else:
+            dataloader_kwargs["collate_fn"] = self._collate_fn
+            if num_workers > 0 and isinstance(dataset, _MappedCollectionDataset):
+                dataloader_kwargs["worker_init_fn"] = dataset.torch_worker_init_fn
         prefetch_factor = getattr(self, "_prefetch_factor", None)
         if num_workers > 0 and prefetch_factor is not None:
             dataloader_kwargs["prefetch_factor"] = prefetch_factor
@@ -1211,6 +1226,23 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
             batch_size=batch_size,
             shuffle=shuffle,
             **dataloader_kwargs,
+        )
+
+    def _get_num_workers(self, dataset: Dataset) -> int:
+        requested_num_workers = getattr(self, "_num_workers", 0)
+        if not self._is_mapped_atac_only_dataset(dataset):
+            return requested_num_workers
+        if requested_num_workers > 0:
+            return requested_num_workers
+        cpu_count = os.cpu_count()
+        return max((cpu_count - 1) if cpu_count is not None else 0, 0)
+
+    def _is_mapped_atac_only_dataset(self, dataset: Dataset) -> bool:
+        return (
+            self._mapped_atac_only
+            and isinstance(dataset, _MappedCollectionDataset)
+            and self._mapped_atac_dataset is not None
+            and dataset.dataset is self._mapped_atac_dataset
         )
 
     def _fetch_modality_tensor(
@@ -1248,24 +1280,14 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
             dtype=np.int64,
         )
 
-    def _collate_mapped_atac_only_batch(
-        self, batch: list[dict[str, object]]
+    def _format_mapped_atac_only_batch(
+        self, batch: dict[str, object]
     ) -> dict[str, torch.Tensor | None]:
-        indices = np.asarray([item["_indices"] for item in batch], dtype=np.int64)
+        indices = torch.as_tensor(batch["_indices"], dtype=torch.int64).reshape(-1)
+        atac_batch = batch["X"]
         if self._sparse_atac:
-            rows = [item["X"] for item in batch]
-            if any(issparse(row) for row in rows):
-                atac_rows = []
-                for row in rows:
-                    if issparse(row):
-                        atac_rows.append(row.tocsr())
-                    else:
-                        atac_rows.append(
-                            csr_matrix(np.asarray(row, dtype=np.float32).reshape(1, -1))
-                        )
-                atac_csr = vstack(atac_rows, format="csr")
-            else:
-                atac_csr = csr_matrix(np.asarray(rows, dtype=np.float32))
+            atac_matrix = np.asarray(atac_batch, dtype=np.float32)
+            atac_csr = csr_matrix(atac_matrix)
             atac_tensor = torch.sparse_csr_tensor(
                 crow_indices=torch.from_numpy(atac_csr.indptr.astype(np.int64, copy=False)),
                 col_indices=torch.from_numpy(atac_csr.indices.astype(np.int64, copy=False)),
@@ -1273,42 +1295,39 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
                 size=atac_csr.shape,
             )
         else:
-            atac_matrix = np.asarray(
-                [
-                    (
-                        row.toarray().ravel()
-                        if issparse(row := item["X"])
-                        else np.asarray(row).ravel()
-                    )
-                    for item in batch
-                ],
-                dtype=np.float32,
-            )
-            atac_tensor = torch.from_numpy(atac_matrix)
+            atac_tensor = torch.as_tensor(atac_batch, dtype=torch.float32)
         return {
             REGISTRY_KEYS.X_KEY: torch.zeros((len(indices), 0), dtype=torch.float32),
             REGISTRY_KEYS.ATAC_X_KEY: atac_tensor,
             "atac_X": atac_tensor,
-            REGISTRY_KEYS.BATCH_KEY: torch.from_numpy(self._batch_codes[indices][:, None]),
+            REGISTRY_KEYS.BATCH_KEY: torch.from_numpy(self._batch_codes[indices.numpy()][:, None]),
             REGISTRY_KEYS.LABELS_KEY: torch.zeros((len(indices), 1), dtype=torch.int64),
-            REGISTRY_KEYS.INDICES_KEY: torch.from_numpy(indices[:, None]),
+            REGISTRY_KEYS.INDICES_KEY: indices[:, None],
             REGISTRY_KEYS.CAT_COVS_KEY: (
-                torch.from_numpy(self._categorical_covariates[indices])
+                torch.from_numpy(self._categorical_covariates[indices.numpy()])
                 if self._categorical_covariates is not None
                 else None
             ),
             REGISTRY_KEYS.CONT_COVS_KEY: (
-                torch.from_numpy(self._continuous_covariates[indices])
+                torch.from_numpy(self._continuous_covariates[indices.numpy()])
                 if self._continuous_covariates is not None
                 else None
             ),
         }
 
+    def on_before_batch_transfer(
+        self,
+        batch,
+        dataloader_idx,
+    ):
+        del dataloader_idx
+        if isinstance(batch, dict) and "_indices" in batch:
+            return self._format_mapped_atac_only_batch(batch)
+        return batch
+
     def _collate_fn(
         self, batch_indices: list[int] | list[dict[str, object]]
     ) -> dict[str, torch.Tensor | None]:
-        if batch_indices and isinstance(batch_indices[0], dict):
-            return self._collate_mapped_atac_only_batch(batch_indices)
         indices = np.asarray(batch_indices, dtype=np.int64)
         obs_names = self._global_obs_names[indices]
         rna_tensor = self._fetch_modality_tensor(
