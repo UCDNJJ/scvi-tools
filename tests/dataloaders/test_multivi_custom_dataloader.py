@@ -51,9 +51,15 @@ class _FakeMappedCollection:
     def __init__(self, artifacts):
         self._artifacts = artifacts
         self._adatas = [artifact.load() for artifact in artifacts]
-        self._offsets = np.cumsum([0, *(adata.n_obs for adata in self._adatas[:-1])], dtype=np.int64)
+        self._offsets = np.cumsum(
+            [0, *(adata.n_obs for adata in self._adatas[:-1])],
+            dtype=np.int64,
+        )
         self.n_obs = sum(adata.n_obs for adata in self._adatas)
-        self.var_joint = pd.Index(np.asarray(self._adatas[0].var_names, dtype=object), dtype=object)
+        self.var_joint = pd.Index(
+            np.asarray(self._adatas[0].var_names, dtype=object),
+            dtype=object,
+        )
         self.n_vars = len(self.var_joint)
 
     def __getitem__(self, index: int):
@@ -163,6 +169,14 @@ def _make_multivi_collections(
     rna_collection = _write_collection_parts(tmp_path, "rna", rna_parts)
     atac_collection = _write_collection_parts(tmp_path, "atac", atac_parts)
     return rna_collection, atac_collection, sorted(set(obs_names)), missing_rna, missing_atac
+
+
+def _collection_obs_names(collection: _FakeCollection) -> list[str]:
+    return [
+        obs_name
+        for artifact in collection.artifacts.all()
+        for obs_name in artifact.load().obs_names.astype(str)
+    ]
 
 
 def _make_sparse_collection_source(tmp_path):
@@ -351,12 +365,10 @@ def test_multivi_custom_dataloader_single_modality(
         _,
     ) = _make_multivi_collections(tmp_path, fully_paired=False)
     present_collection = rna_collection if rna_only else atac_collection
-    present_obs_names = sorted(
-        {
-            obs_name
-            for artifact in present_collection.artifacts.all()
-            for obs_name in artifact.load().obs_names.astype(str)
-        }
+    present_obs_names = (
+        sorted(set(_collection_obs_names(present_collection)))
+        if rna_only
+        else _collection_obs_names(present_collection)
     )
     datamodule = MultiVIMappedCollectionDataModule(
         rna_collection=present_collection if rna_only else None,
@@ -546,8 +558,39 @@ def test_multivi_custom_dataloader_atac_only_uses_mapped_backend(tmp_path):
     assert atac_collection.mapped_calls[0]["kwargs"] == {"parallel": True}
 
     dataloader = datamodule.train_dataloader()
-    assert dataloader.worker_init_fn == datamodule._dataset.torch_worker_init_fn
+    assert dataloader.worker_init_fn == datamodule._mapped_atac_dataset.torch_worker_init_fn
+    assert dataloader.collate_fn is not datamodule._collate_fn
     _shutdown_workers(dataloader)
+
+
+@pytest.mark.dataloader
+@dependencies("lamindb")
+def test_multivi_custom_dataloader_atac_only_formats_mapped_batches(tmp_path):
+    _, atac_collection, _, _, _ = _make_multivi_collections(tmp_path, fully_paired=False)
+    expected_obs_names = _collection_obs_names(atac_collection)
+    datamodule = MultiVIMappedCollectionDataModule(
+        rna_collection=None,
+        atac_collection=atac_collection,
+        batch_key="batch",
+        batch_size=4,
+        shuffle=False,
+        categorical_covariate_keys=["site"],
+        continuous_covariate_keys=["score"],
+    )
+
+    raw_batch = next(iter(datamodule.train_dataloader()))
+    batch = datamodule.on_before_batch_transfer(raw_batch, dataloader_idx=0)
+
+    assert np.array_equal(
+        datamodule._global_obs_names,
+        np.asarray(expected_obs_names, dtype=object),
+    )
+    assert torch.equal(batch[REGISTRY_KEYS.INDICES_KEY].squeeze(-1), torch.arange(4))
+    assert batch[REGISTRY_KEYS.X_KEY].shape == (4, 0)
+    assert batch[REGISTRY_KEYS.ATAC_X_KEY].shape == (4, datamodule.n_regions)
+    assert batch[REGISTRY_KEYS.BATCH_KEY].shape == (4, 1)
+    assert batch[REGISTRY_KEYS.CAT_COVS_KEY].shape == (4, 1)
+    assert batch[REGISTRY_KEYS.CONT_COVS_KEY].shape == (4, 1)
 
 
 @pytest.mark.dataloader
