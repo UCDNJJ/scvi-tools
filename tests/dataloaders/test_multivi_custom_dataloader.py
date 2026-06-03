@@ -558,7 +558,7 @@ def test_multivi_custom_dataloader_atac_only_uses_mapped_backend(tmp_path):
     assert atac_collection.mapped_calls[0]["kwargs"] == {"parallel": True}
 
     dataloader = datamodule.train_dataloader()
-    assert dataloader.worker_init_fn == datamodule._mapped_atac_dataset.torch_worker_init_fn
+    assert dataloader.worker_init_fn == datamodule._dataset.torch_worker_init_fn
     assert dataloader.collate_fn is not datamodule._collate_fn
     _shutdown_workers(dataloader)
 
