@@ -1249,7 +1249,7 @@ class MultiVIMappedCollectionDataModule(LightningDataModule):
 
     @staticmethod
     def _get_mapped_atac_worker_init_fn(dataset: _MappedCollectionDataset):
-        return dataset.dataset.torch_worker_init_fn
+        return dataset.torch_worker_init_fn
 
     def _fetch_modality_tensor(
         self,
